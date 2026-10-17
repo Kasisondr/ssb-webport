@@ -1,0 +1,127 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4a9f987..aed7744 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -945,7 +945,7 @@ elseif (EMSCRIPTEN)
+     )
+     # -sUSE_OFFSET_CONVERTER was removed in emscripten 6.x (offset conversion
+     # is built in now); passing it there is a hard link error.
+-    if (EMSCRIPTEN_VERSION VERSION_LESS 6.0)
++    if (DEFINED EMSCRIPTEN_VERSION AND EMSCRIPTEN_VERSION VERSION_LESS 6.0)
+         target_link_options(${PROJECT_NAME} PRIVATE -sUSE_OFFSET_CONVERTER=1)
+     endif()
+ else()
+diff --git a/port/port_save.cpp b/port/port_save.cpp
+index 18e1807..5b0b800 100644
+--- a/port/port_save.cpp
++++ b/port/port_save.cpp
+@@ -9,6 +9,17 @@
+ #include <cstdlib>
+ #include <mutex>
+ #include <string>
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++EM_JS(void, local_web_persist_sram, (const char *path), {
++    try {
++        var data = FS.readFile(UTF8ToString(path));
++        var text = "";
++        for (var i = 0; i < data.length; i++) text += String.fromCharCode(data[i]);
++        localStorage.setItem("smash64.native.sram.us", btoa(text));
++    } catch (error) { console.error("Unable to persist Smash save", error); }
++});
++#endif
+ 
+ // Where the SRAM file lives, in priority order:
+ //
+@@ -132,5 +143,8 @@ extern "C" int port_save_write(uintptr_t offset, const void *src, size_t size)
+                  wrote, size, (unsigned long)offset);
+         return -1;
+     }
++#ifdef __EMSCRIPTEN__
++    local_web_persist_sram(path);
++#endif
+     return 0;
+ }
+diff --git a/web/index.html b/web/index.html
+index 50115e6..be131c2 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -5,7 +5,7 @@
+ <title>BattleShip (WASM)</title>
+ <style>
+   html, body { margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden; }
+-  html.is-embedded, html.is-embedded body, html.is-embedded body * { cursor: none !important; }
++  html.is-embedded, html.is-embedded body, html.is-embedded body * { cursor: default !important; }
+   html.is-embedded #boot, html.is-embedded #pad { display: none; }
+   #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+   /* Hold the canvas element at 4:3 and letterbox inside the viewport;
+@@ -430,11 +430,11 @@ window.controllerPorts = (() => {
+   // the site's tutorial labels each position with what that layout prints
+   // there (Dvorak sees C V P G S where QWERTY sees J K L I O; Chromium only, QWERTY caps elsewhere). Mirrors
+   // libultraship's defaults: WASD/arrows stick, J=A K=B L=Z I=L O=R,
+-  // Space/Enter=Start, U=C-up, TFGH=D-pad, Ctrl=A Alt=B Shift=Z.
++  // Space=C-up, Enter=Start, J/mouse-left=A, K/mouse-right=B, Shift=R, E/mouse-middle=Z.
+   const KEY_MAP = {
+-    KeyJ: 'A', ControlLeft: 'A', ControlRight: 'A', KeyK: 'B', AltLeft: 'B', AltRight: 'B',
+-    KeyL: 'Z', ShiftLeft: 'Z', ShiftRight: 'Z', KeyI: 'L', KeyO: 'R',
+-    Space: 'START', Enter: 'START', NumpadEnter: 'START', KeyU: 'CUP',
++    KeyJ: 'A', Mouse0: 'A', KeyK: 'B', Mouse2: 'B',
++    KeyE: 'Z', Mouse1: 'Z', ShiftLeft: 'R', ShiftRight: 'R', KeyL: 'R', KeyI: 'L',
++    Enter: 'START', NumpadEnter: 'START', Space: 'CUP', KeyU: 'CUP',
+     KeyT: 'DUP', KeyG: 'DDOWN', KeyF: 'DLEFT', KeyH: 'DRIGHT',
+     KeyW: 'UP', ArrowUp: 'UP', KeyS: 'DOWN', ArrowDown: 'DOWN',
+     KeyA: 'LEFT', ArrowLeft: 'LEFT', KeyD: 'RIGHT', ArrowRight: 'RIGHT',
+@@ -458,6 +458,17 @@ window.controllerPorts = (() => {
+   // composing over the canvas must not swallow the press.
+   window.addEventListener('keydown', (e) => { held.add(keyName(e)); }, true);
+   window.addEventListener('keyup', (e) => { held.delete(keyName(e)); }, true);
++  // LOCAL_KBM_INPUT: Mouse state enters the same native controller sampler.
++  const boundKeys = new Set([...Object.keys(KEY_MAP), 'AltLeft', 'AltRight']);
++  window.addEventListener('keydown', e => { if (boundKeys.has(e.code)) e.preventDefault(); }, true);
++  document.getElementById('canvas').addEventListener('pointerdown', e => {
++    if (e.pointerType !== 'mouse') return;
++    e.preventDefault(); held.add('Mouse' + e.button);
++    document.getElementById('canvas').setPointerCapture?.(e.pointerId);
++    document.getElementById('canvas').focus();
++  });
++  window.addEventListener('pointerup', e => held.delete('Mouse' + e.button));
++  window.addEventListener('pointercancel', releaseKeyboard);
+   window.addEventListener('blur', releaseKeyboard);
+   window.addEventListener('pagehide', releaseKeyboard);
+   document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeyboard(); });
+@@ -472,8 +483,10 @@ window.controllerPorts = (() => {
+       else button |= BTN[b];
+     }
+     x = Math.sign(x); y = Math.sign(y);
+-    return { button, sx: virtualStick ? virtualStick.x : x * STICK_MAX,
+-                     sy: virtualStick ? virtualStick.y : y * STICK_MAX };
++    const walk = held.has('AltLeft') || held.has('AltRight');
++    const magnitude = (walk ? 0.42 : 1) * STICK_MAX / (x && y ? Math.SQRT2 : 1);
++    return { button, sx: virtualStick ? virtualStick.x : Math.round(x * magnitude),
++                     sy: virtualStick ? virtualStick.y : Math.round(y * magnitude) };
+   }
+ 
+   // Engine entry point: fill 4 x {kind, button, stick_x, stick_y} int32s.
+@@ -506,6 +519,7 @@ window.controllerPorts = (() => {
+     readPorts,
+     sampleKeyboard,
+     setVirtualStick,
++    releaseKeyboard,
+     snapshot,
+     apply,
+     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+@@ -641,6 +655,14 @@ var Module = {
+         setStatus(`files ${++done}/${manifest.files.length}`);
+       }));
+ 
++      // LOCAL_SRAM_RESTORE: restore the native game's SRAM file before main().
++      if (typeof ENV !== 'undefined') ENV.SSB64_SAVE_PATH = '/ssb64_save.bin';
++      const savedSram = localStorage.getItem('smash64.native.sram.us');
++      if (savedSram) {
++        const raw = atob(savedSram);
++        FS.writeFile('/ssb64_save.bin', Uint8Array.from(raw, c => c.charCodeAt(0)));
++      }
++
+       // The ROM-derived archive is not part of the package: build it in the
+       // browser from the ROM the site stored in IndexedDB (or reuse the copy
+       // built earlier for this recipe). Dev packages made with PACKAGE_O2R=1

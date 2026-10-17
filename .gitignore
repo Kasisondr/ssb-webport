@@ -1,0 +1,6 @@
+.venv/
+build/
+__pycache__/
+*.z64
+*.n64
+*.v64

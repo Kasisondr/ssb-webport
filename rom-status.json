@@ -1,0 +1,46 @@
+{
+  "engine": {
+    "game_code_build": "us (NALE) — one build serves every supported region",
+    "reloc_table": {
+      "us": { "rom_addr": "0x1AC870", "file_count": 2132 },
+      "eu": { "rom_addr": "0x262E20", "file_count": 2149 }
+    },
+    "asset_recipe": { "us": "BattleShip/yamls/us", "eu": "BattleShip/yamls/eu" }
+  },
+  "supported_roms": [
+    {
+      "region": "US v1.0 (NALE)",
+      "sha1": "e2929e10fccc0aa84e5776227e798abc07cedabf",
+      "recipe": "BattleShip/yamls/us",
+      "file_ids": "native (the port's game code is the US build)"
+    },
+    {
+      "region": "Europe (En,Fr,De) (NALP)",
+      "path": "../Super Smash Bros. (Europe) (En,Fr,De).z64",
+      "sha1": "6ee8a41fef66280ce3e3f0984d00b96079442fb9",
+      "game_code": "NALP",
+      "recipe": "BattleShip/yamls/eu",
+      "id_map": "tools/eu_file_id_map.json",
+      "file_count": 2149,
+      "us_names_mapped": 2132,
+      "europe_only_files": [17, 18, 33, 172, 173, 174, 176, 177, 178, 179, 208, 209, 210, 265, 266, 269, 270],
+      "mapping": {
+        "method": "monotone alignment of the EU reloc table against the US file-id table over (decompressed size, internal reloc pointer count, external reloc pointer count)",
+        "section": "tools/eu_reloc_map.py",
+        "generator": "tools/generate_eu_recipe.py",
+        "id_step_function": "eu_id - us_id is non-decreasing and rises by exactly 17, matching the file-count difference: the European build inserts released-language variants next to the files they localise",
+        "structural_fingerprint_match": "2107/2132 (98.83%)",
+        "decompressed_size_match": "2106/2132 (98.78%)",
+        "remaining_differences": "25 localised menu/scene/name files (MN*, SC*, CharacterNames, MiscData029) whose European content is larger; their ids are pinned by identical-fingerprint anchors on both sides",
+        "extern_references": "44 of 3372 external reloc references point at Europe-only files; every one of them comes from another Europe-only file, so nothing the engine loads depends on them (tools/eu_extern_probe.py)"
+      },
+      "supported_by_native_extractor": true
+    }
+  ],
+  "unsupported_roms": [
+    {
+      "region": "Japan (NALJ)",
+      "note": "needs an engine built with -DSSB64_VERSION=jp; the Japanese reloc table (0x1ACAF0, 2107 files) and yamls/jp exist, but the launcher only accepts the US and European ROMs."
+    }
+  ]
+}

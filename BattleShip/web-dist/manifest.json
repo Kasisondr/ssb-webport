@@ -1,0 +1,8 @@
+{ "files": [
+  { "path": "/BattleShip.o2r.recipe", "url": "files/BattleShip.o2r.recipe?v=c5a89c4fd958" },
+  { "path": "/assets/custom/fonts/Inconsolata-Regular.ttf", "url": "files/assets/custom/fonts/Inconsolata-Regular.ttf?v=c5a89c4fd958" },
+  { "path": "/assets/custom/fonts/Montserrat-Regular.ttf", "url": "files/assets/custom/fonts/Montserrat-Regular.ttf?v=c5a89c4fd958" },
+  { "path": "/config.yml", "url": "files/config.yml?v=c5a89c4fd958" },
+  { "path": "/f3d.o2r", "url": "files/f3d.o2r?v=c5a89c4fd958" },
+  { "path": "/gamecontrollerdb.txt", "url": "files/gamecontrollerdb.txt?v=c5a89c4fd958" }
+]}

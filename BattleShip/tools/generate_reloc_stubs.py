@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+generate_reloc_stubs.py — Emit include/reloc_data.h as a complete
+#define-only mirror of tools/reloc_data_symbols.us.txt.
+
+The decomp references ~3900 `ll*` linker symbols across src/. On N64 the
+MIPS linker turns each one into an absolute address constant via
+`symbols/reloc_data_symbols.us.txt` (vendored here as
+tools/reloc_data_symbols.us.txt). On PC we cannot use a MIPS linker, but
+the decomp uses many of these symbols as file-scope struct-literal
+initialisers — which C11 only accepts if they are **constant
+expressions**, not `extern` variables. So we emit a `#define`-only
+header whose entries are the real numeric values from the symbols table.
+
+The header includes **every** symbol in the vendored table, not just the
+subset that src/ currently references. That matters because downstream
+tools (tools/generate_yamls.py) parse reloc_data.h to turn `ll*FileID`
+symbols into human-readable archive paths — `DkIcon`, `MasterHandIcon`,
+etc. — and the game looks those files up by file_id at runtime even
+though the `ll*` symbol names never appear in src/. Filtering to
+src/-referenced symbols silently drops entries from the name table and
+causes Torch to extract the files under their fallback `file_NNNN`
+names, which then don't match `port/resource/RelocFileTable.cpp`.
+
+Any `ll*` identifier that src/ references but that is missing from the
+symbols table (e.g. a brand-new symbol added to the decomp sources) is
+still emitted, as an `((intptr_t)0)` fallback with a `/* STUBBED */`
+comment so it can be grepped and triaged later.
+
+Generates:
+    include/reloc_data.h  — `#define <name> ((intptr_t)<value>)` per
+                            symbol in the table, plus stubs for any
+                            extra `ll*` names referenced by src/.
+
+Usage: run from the repo root.
+    python3 tools/generate_reloc_stubs.py [--version {us,jp}]
+
+  us (default): tools/reloc_data_symbols.us.txt -> include/reloc_data.us.h
+  jp          : tools/reloc_data_symbols.jp.txt -> include/reloc_data.jp.h
+
+The decomp's selector shim (decomp/include/reloc_data.h) #includes
+reloc_data.<REGION>.h, so both versions' headers coexist in the source
+tree and a US build dir and a JP build dir never fight over one file.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+# Decomp source lives in the `decomp/` submodule (port-patches branch). The
+# pre-submodule path was ROOT/src; it's still on disk during the submodule
+# migration but slated for deletion. Prefer the submodule path when present.
+SRC_DIR = (ROOT / "decomp" / "src") if (ROOT / "decomp" / "src").is_dir() else (ROOT / "src")
+DECOMP_TOOLS = (ROOT / "decomp" / "tools") if (ROOT / "decomp" / "tools").is_dir() else (ROOT / "tools")
+_VERSION = "us"
+
+# Per-version inputs/outputs. US keeps the legacy flat header name so its
+# generated output path AND contents are byte-for-byte unchanged from before
+# versioning; other versions get a version-suffixed sibling.
+VERSIONS = {
+    "us": {"symbols": "reloc_data_symbols.us.txt", "header": "reloc_data.us.h"},
+    "jp": {"symbols": "reloc_data_symbols.jp.txt", "header": "reloc_data.jp.h"},
+}
+
+# Defaults (US) so the module is importable without selecting a version.
+HEADER_OUT = ROOT / "include" / VERSIONS["us"]["header"]
+SYMBOLS_TXT = ROOT / "tools" / VERSIONS["us"]["symbols"]
+
+
+def select_version(version):
+    """Repoint the symbols-input / header-output globals at the version."""
+    global HEADER_OUT, SYMBOLS_TXT, _VERSION
+    _VERSION = version
+    cfg = VERSIONS[version]
+    SYMBOLS_TXT = ROOT / "tools" / cfg["symbols"]
+    HEADER_OUT = ROOT / "include" / cfg["header"]
+
+SYMBOL_RE = re.compile(r"\bll[A-Z_][A-Za-z0-9_]*\b")
+# Comments are not code. Upstream's relocData sources describe their contents
+# in prose ("5 Arwing pilot anim scripts (llGRSectorMapArwing{1..5}AnimJoint)"),
+# and scanning that raw would mint a STUBBED define for a symbol nothing
+# references. Strip comments and string/char literals before matching.
+COMMENT_RE = re.compile(
+    r"//[^\n]*"                 # line comment
+    r"|/\*.*?\*/"                # block comment
+    r"|\"(?:\\.|[^\"\\\n])*\""      # string literal
+    r"|'(?:\\.|[^'\\\n])*'",           # char literal
+    re.S,
+)
+
+
+def strip_noncode(text: str) -> str:
+    """Blank out comments and literals, preserving newlines for line numbers."""
+    return COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+ASSIGN_RE = re.compile(r"^\s*(ll[A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+?)\s*;\s*$")
+DESCRIPTION_RE = re.compile(r"^-(\d+):\s*(\S+)\s*$")
+NAME_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def collect_src_symbols() -> set[str]:
+    """Scan src/ for every `ll*` identifier referenced in the decomp.
+
+    Used only to detect `ll*` names that are not in the symbols table —
+    the actual header contents come from parse_symbol_values().
+    """
+    symbols: set[str] = set()
+    for path in SRC_DIR.rglob("*"):
+        if path.suffix not in (".c", ".h"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for match in SYMBOL_RE.findall(strip_noncode(text)):
+            symbols.add(match)
+    return symbols
+
+
+def derive_described_symbols() -> dict[str, str]:
+    """Recover `ll<Name>FileID` values from the decomp's per-version file list.
+
+    decomp/tools/relocFileDescriptions.<version>.txt names every reloc file as
+    `-NNN: Name`, so `-500: FTMarioAnimWalk1` fixes
+    `llFTMarioAnimWalk1FileID == 500`. The vendored symbol table only carries
+    the subset the ROM's linker exported by name, which is why ~1770 perfectly
+    well-defined file IDs used to fall through to `((intptr_t)0)`.
+
+    This MUST be read per version. US and JP use different file ID spaces —
+    upstream says so in src/relocData/converted_files.jp.mk, and 1937 of the
+    2107 names they share resolve to different IDs. Deriving JP values from
+    anything US-shaped (e.g. the `<id>_<Name>.c` relocData filenames, which
+    encode US IDs only) would silently mis-address every JP animation.
+
+    The vendored table still wins on conflict; it is the authority. Validated
+    at introduction: zero disagreements against the vendored table on either
+    version (285 overlapping symbols on US, 260 on JP).
+    """
+    path = DECOMP_TOOLS / f"relocFileDescriptions.{_VERSION}.txt"
+    if not path.is_file():
+        print(f"warning: {path.name} not found; file IDs that the vendored "
+              f"table lacks will stay stubbed", file=sys.stderr)
+        return {}
+    derived: dict[str, str] = {}
+    seen: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        m = DESCRIPTION_RE.match(line.strip())
+        if not m:
+            continue
+        file_id, name = int(m.group(1)), m.group(2)
+        if not NAME_RE.fullmatch(name):
+            continue
+        symbol = f"ll{name}FileID"
+        if seen.get(symbol, file_id) != file_id:
+            print(f"warning: {symbol} maps to both {seen[symbol]} and "
+                  f"{file_id}; leaving it unresolved", file=sys.stderr)
+            derived.pop(symbol, None)
+            continue
+        seen[symbol] = file_id
+        derived[symbol] = str(file_id)
+    return derived
+
+
+def parse_symbol_values() -> dict[str, str]:
+    """Parse tools/reloc_data_symbols.us.txt into {name: value_literal}.
+
+    Blank lines and `#`-comment lines are ignored. Values are kept as
+    their original textual form (e.g. `0x73c0`, `2132`) so the generated
+    header preserves the same base as upstream — it reads better when
+    you grep for a specific file ID.
+    """
+    if not SYMBOLS_TXT.is_file():
+        print(
+            f"error: {SYMBOLS_TXT.relative_to(ROOT)} not found — "
+            "the generated header will only contain stubs.",
+            file=sys.stderr,
+        )
+        return {}
+    values: dict[str, str] = {}
+    for lineno, raw in enumerate(SYMBOLS_TXT.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = ASSIGN_RE.match(raw)
+        if not m:
+            print(
+                f"warning: {SYMBOLS_TXT.name}:{lineno}: unrecognised line: {raw!r}",
+                file=sys.stderr,
+            )
+            continue
+        name, literal = m.group(1), m.group(2)
+        values[name] = literal
+    return values
+
+
+def write_header(values: dict[str, str], extra_stubs: set[str]) -> None:
+    # Preserve upstream order inside the table, then append any extra
+    # src/-only stubs sorted for determinism.
+    table_names = list(values.keys())
+    stub_names = sorted(extra_stubs)
+
+    lines = [
+        "#ifndef _RELOC_DATA_H_",
+        "#define _RELOC_DATA_H_",
+        "",
+        "/*",
+        " * reloc_data.h — AUTO-GENERATED. Run tools/generate_reloc_stubs.py to",
+        f" * regenerate after updating tools/{SYMBOLS_TXT.name} or after",
+        " * adding new decomp sources that reference `ll*` linker symbols.",
+        " *",
+        f" * Every symbol in tools/{SYMBOLS_TXT.name} (vendored from",
+        " * ssb-decomp-re) is mirrored here as a #define holding the real",
+        " * numeric value, so downstream tools (generate_yamls.py,",
+        " * generate_reloc_table.py) always see the full name table even if",
+        " * the individual symbol isn't referenced from src/ directly.",
+        " *",
+        " * Any `ll*` name referenced by src/ but missing from the table is",
+        " * emitted as `((intptr_t)0)` with a trailing STUBBED marker so it",
+        " * can be grep'd and triaged later — search the file for 'STUBBED'.",
+        " *",
+        " * Each symbol is emitted as a `#define` (rather than `extern intptr_t`)",
+        " * so it works as a compile-time integer constant inside file-scope",
+        " * struct initialisers, which C11 does not allow for external variables.",
+        " */",
+        "",
+        "#include <stdint.h>",
+        "",
+        f"/* {len(table_names)} symbols from the vendored table, "
+        f"{len(stub_names)} extra stubs from src/. */",
+        "",
+    ]
+
+    # Use `((intptr_t)<literal>)` for every entry so downstream tools
+    # (tools/generate_yamls.py) see a consistent regex-friendly format.
+    for name in table_names:
+        lines.append(f"#define {name} ((intptr_t){values[name]})")
+
+    if stub_names:
+        lines.append("")
+        lines.append("/* ll* symbols referenced by src/ but absent from the symbols table. */")
+        for name in stub_names:
+            lines.append(f"#define {name} ((intptr_t)0) /* STUBBED */")
+
+    lines += ["", "#endif /* _RELOC_DATA_H_ */", ""]
+    new_content = "\n".join(lines)
+    # Skip the write when the existing file already has identical contents.
+    # The output is ~340 KB and regenerated on every build trigger; a stale
+    # editor / reader (pylance, antivirus) holding even a brief shared lock
+    # would otherwise crash the build with PermissionError.
+    if HEADER_OUT.exists():
+        try:
+            if HEADER_OUT.read_text(encoding="utf-8") == new_content:
+                return
+        except OSError:
+            pass
+    HEADER_OUT.write_text(new_content, encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", choices=sorted(VERSIONS), default="us",
+                        help="ROM version (default: us)")
+    select_version(parser.parse_args().version)
+
+    values = parse_symbol_values()
+    src_symbols = collect_src_symbols()
+
+    # Fill gaps in the vendored table from relocData filenames. The table is
+    # authoritative wherever it has an entry, so derived values only ever
+    # replace what would otherwise have been a ((intptr_t)0) stub.
+    derived = derive_described_symbols()
+    from_table = len(src_symbols & set(values.keys()))
+    filled = {k: v for k, v in derived.items() if k not in values}
+    values.update(filled)
+    extra_stubs = src_symbols - set(values.keys())
+
+    print(f"Loaded {len(values) - len(filled)} symbols from {SYMBOLS_TXT.relative_to(ROOT)}")
+    print(f"Scanned src/ and found {len(src_symbols)} ll* references")
+    print(f"  {from_table} referenced symbols resolve from the table")
+    print(f"  {len(src_symbols & set(filled))} referenced symbols resolve from relocFileDescriptions")
+    print(f"  {len(extra_stubs)} referenced symbols stub to ((intptr_t)0)")
+
+    write_header(values, extra_stubs)
+    print(f"Wrote {HEADER_OUT.relative_to(ROOT)} "
+          f"({len(values) + len(extra_stubs)} total #defines)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1793 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BattleShip (WASM)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden; }
+  html.is-embedded, html.is-embedded body, html.is-embedded body * { cursor: default !important; }
+  html.is-embedded #boot, html.is-embedded #pad { display: none; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+  /* Hold the canvas element at 4:3 and letterbox inside the viewport;
+   * SDL sizes the GL buffer to match the element, so the game renders at
+   * the aspect the element has — a free-size canvas means a stretched game. */
+  canvas {
+    width: min(100vw, calc(100vh * 4 / 3));
+    height: min(100vh, calc(100vw * 3 / 4));
+    image-rendering: pixelated;
+    outline: none;
+  }
+  #status {
+    position: fixed; left: 12px; bottom: 10px; color: #9f9;
+    font: 12px/1.4 ui-monospace, monospace; white-space: pre; pointer-events: none;
+  }
+  /* ---- matchup card (engine holds the battle while this shows) ---- */
+  #matchup {
+    position: fixed; inset: 0; z-index: 20; display: none;
+    background:
+      radial-gradient(ellipse at 50% 60%, rgba(140, 20, 10, .85) 0%, rgba(40, 6, 4, .95) 45%, #000 100%),
+      #000;
+    color: #fff; font-family: "Arial Black", "Helvetica Neue", Arial, sans-serif;
+    user-select: none; cursor: default;
+    opacity: 0; transition: opacity .25s ease;
+  }
+  #matchup.show { display: flex; align-items: center; justify-content: center; }
+  #matchup.in { opacity: 1; }
+  #matchup .row {
+    display: flex; align-items: center; justify-content: center;
+    gap: clamp(12px, 3vw, 48px); width: 100%; padding: 0 3vw; box-sizing: border-box;
+  }
+  #matchup .card {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    width: min(28vw, 42vh); flex: 0 1 auto;
+    opacity: 0; transform: translateX(var(--from, 0)) scale(.9);
+    transition: opacity .35s ease, transform .45s cubic-bezier(.2, 1.4, .4, 1);
+  }
+  #matchup.in .card { opacity: 1; transform: none; }
+  #matchup .art {
+    width: 100%; aspect-ratio: 1; box-sizing: border-box;
+    border: 4px solid var(--pc, #ddd); border-radius: 6px;
+    background: #1a0806 center / cover no-repeat;
+    box-shadow: 0 0 0 2px #000, 0 12px 40px rgba(0, 0, 0, .7), 0 0 60px rgba(255, 90, 40, .25);
+    image-rendering: auto; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; position: relative;
+  }
+  #matchup .art.vanilla { background: linear-gradient(160deg, #3a3a3a, #101010); }
+  #matchup .art.vanilla::before {
+    content: attr(data-initial); font-size: min(14vw, 20vh); color: rgba(255,255,255,.18);
+    line-height: 1;
+  }
+  #matchup .tag {
+    position: absolute; left: 6px; top: 6px; padding: 2px 8px; border-radius: 3px;
+    background: var(--pc, #ddd); color: #000; font-size: clamp(11px, 1.6vw, 18px);
+    letter-spacing: .06em; box-shadow: 0 1px 0 #000;
+  }
+  #matchup .name {
+    font-size: clamp(16px, 2.6vw, 38px); line-height: 1.1; text-align: center;
+    letter-spacing: .04em; text-transform: uppercase; font-style: italic;
+    color: #ffe98a;
+    text-shadow: 0 0 2px #000, 2px 2px 0 #000, -2px 2px 0 #000, 2px -2px 0 #000, -2px -2px 0 #000,
+                 0 6px 18px rgba(0,0,0,.8);
+    max-width: 100%; overflow-wrap: anywhere;
+  }
+  #matchup .vs {
+    font-size: clamp(28px, 6vw, 96px); font-style: italic; font-weight: 900; line-height: 1;
+    color: #fff; flex: 0 0 auto;
+    text-shadow: 0 0 3px #000, 3px 3px 0 #000, -3px 3px 0 #000, 3px -3px 0 #000, -3px -3px 0 #000,
+                 0 0 40px rgba(255, 120, 40, .9);
+    opacity: 0; transform: scale(2.2); transition: opacity .2s ease .25s, transform .35s cubic-bezier(.2, 1.6, .4, 1) .25s;
+  }
+  #matchup.in .vs { opacity: 1; transform: none; }
+  #matchup .hint {
+    position: absolute; bottom: 4vh; left: 0; right: 0; text-align: center;
+    font: 12px/1.4 ui-monospace, monospace; color: rgba(255,255,255,.45); letter-spacing: .1em;
+  }
+  #matchup.compact .card { width: min(20vw, 34vh); }
+  #matchup.compact .vs { font-size: clamp(20px, 4vw, 64px); }
+</style>
+<script>
+// The merged site renders its hand cursor above this iframe. Relay pointer
+// coordinates to the parent so the hand keeps tracking across the game, and
+// hide the iframe's native cursor only when the engine is embedded.
+if (window.parent !== window) {
+  document.documentElement.classList.add('is-embedded');
+  const pointerKinds = {
+    pointermove: 'move',
+    pointerdown: 'down',
+    pointerup: 'up',
+    pointercancel: 'cancel',
+  };
+  for (const [eventType, kind] of Object.entries(pointerKinds)) {
+    window.addEventListener(eventType, (event) => {
+      window.parent.postMessage({
+        type: 'opensmash-game-pointer',
+        kind,
+        x: event.clientX,
+        y: event.clientY,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+      }, window.location.origin);
+    }, { capture: true, passive: true });
+  }
+}
+</script>
+</head>
+<body>
+<div id="wrap"><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas></div>
+<div id="status">loading…</div>
+<div id="matchup" aria-live="polite"><div class="row"></div><div class="hint">PRESS ANY BUTTON</div></div>
+<script>
+// Shared roster helpers. ROSTER_VARIANT: skeleton-variant name per fighter
+// kind (index = fkind, '' = the mario-default bundle). rosterBaseFk: which
+// fighter a character actually PLAYS as — resolution order:
+//   URL ?base=slug:target,slug:target  (ad-hoc experiments)
+//   > /roster.json "base"               (explicit metadata or balanced server assignment)
+//   > the tile the character sits on    (legacy fallback)
+// The tile only decides WHERE the character appears on the select screen;
+// the base decides skeleton, moveset and which mesh variant is staged.
+window.ROSTER_VARIANT = ['', 'fox', 'donkey', 'samus', 'luigi', 'link',
+                         'yoshi', 'captain', 'kirby', 'pikachu', 'purin', 'ness'];
+window.rosterBaseFk = (c, tileFk) => {
+  const V = window.ROSTER_VARIANT;
+  const alias = { mario: '', donkeykong: 'donkey', dk: 'donkey',
+                  jigglypuff: 'purin', falcon: 'captain', captainfalcon: 'captain' };
+  let name = null;
+  for (const kv of (new URLSearchParams(location.search).get('base') || '').split(',')) {
+    const [s, t] = kv.split(':');
+    if (s === c.slug && t) name = t;
+  }
+  name = name ?? c.base ?? V[tileFk];
+  name = alias[name] ?? name;
+  let fk = name === '' ? 0 : V.indexOf(name);
+  if (fk < 0) { console.warn(`roster: unknown base '${name}' for ${c.slug}`); fk = tileFk; }
+  return fk;
+};
+// stageable = the character's resolved base variant bundle exists
+window.rosterStageable = (c, tileFk) => {
+  const fk = window.rosterBaseFk(c, tileFk);
+  return fk === 0 || (c.variants || []).includes(window.ROSTER_VARIANT[fk]);
+};
+</script>
+<script>
+// Capture runs need readable canvas contents at arbitrary points; SDL
+// creates the GL context with preserveDrawingBuffer=false, so patch
+// getContext before the engine loads. Gated to ?capture= runs only.
+if (new URLSearchParams(location.search).has('capture')) {
+  const _gc = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+    if (typeof type === 'string' && type.indexOf('webgl') === 0) {
+      attrs = Object.assign({}, attrs || {}, { preserveDrawingBuffer: true });
+    }
+    return _gc.call(this, type, attrs);
+  };
+}
+</script>
+<script>
+window.__lastError = null;
+window.addEventListener('unhandledrejection', (e) => {
+  window.__lastError = (e.reason && e.reason.stack) ? String(e.reason.stack) : String(e.reason);
+  reportEngineFailure(e.reason);
+});
+window.addEventListener('error', (e) => {
+  if (e.error) reportEngineFailure(e.error);
+});
+const statusEl = document.getElementById('status');
+const setStatus = (t) => { statusEl.textContent = t; };
+function reportEngineFailure(reason) {
+  if (window.__shellUnloading) return;
+  window.__lastError = String(reason?.stack || reason);
+  const message = /out of memory|could not allocate|cannot allocate/i.test(String(reason))
+    ? 'Not enough browser memory to start the game. Close other tabs and try again.'
+    : 'Game failed: ' + String(reason?.message || reason);
+  setStatus(message);
+}
+
+// ---- stall watch (?SSB64_STALL_WATCH=1) ---------------------------------
+// __stalls  : per-hitch records pushed by Module.onStall (engine side).
+// __heapLog : 250ms JS-heap samples. setInterval cannot fire while the main
+//             thread is blocked, so a gap in this log brackets the freeze —
+//             and a sharp usedJSHeapSize DROP across that gap is the
+//             signature of a major GC, as opposed to engine work.
+// dumpStalls(): console.table of everything, called by hand after a demo.
+window.__stalls = [];
+window.__heapLog = [];
+window.__visLog = [];
+// Gamepad-poll instrumentation: Chrome allocates fresh Gamepad/button/axis
+// wrapper objects on EVERY navigator.getGamepads() call (per connected pad).
+// SDL polls each frame, so connected controllers are a steady per-frame JS
+// allocator that no-pad test rigs never see. Count calls + pads so
+// dumpStalls can correlate heap growth with polling.
+window.__gpStats = { calls: 0, pads: 0 };
+window.__slowLoads = [];
+if (navigator.getGamepads) {
+  const origGP = navigator.getGamepads.bind(navigator);
+  navigator.getGamepads = function () {
+    const r = origGP();
+    window.__gpStats.calls++;
+    let n = 0; for (const g of r) if (g) n++;
+    window.__gpStats.pads = n;
+    return r;
+  };
+}
+if (new URLSearchParams(location.search).get('SSB64_STALL_WATCH') === '1') {
+  setInterval(() => {
+    const H = window.__heapLog;
+    H.push({
+      t: Math.round(performance.now()),
+      jsMb: performance.memory ? (performance.memory.usedJSHeapSize >> 20) : -1,
+      wasmMb: (typeof Module !== 'undefined' && Module.HEAPU8) ? (Module.HEAPU8.byteLength >> 20) : 0,
+      // dlmalloc break (high-water) — what INITIAL_MEMORY actually must cover.
+      usedMb: (typeof Module !== 'undefined' && Module.calledRun && Module._port_heap_used) ? (Module._port_heap_used() >>> 20) : -1,
+      // Chrome clamps setTimeout/setInterval to 1000ms for a tab it considers
+      // hidden — which includes NATIVE WINDOW OCCLUSION (another app's window
+      // covering the browser, e.g. OBS). The pacer in port.cpp rides
+      // emscripten_sleep -> setTimeout, so a clamp drops the game to 1fps and
+      // starves the audio queue. Stamping visibility on every sample tells a
+      // throttle apart from a GC pause or engine work.
+      vis: document.visibilityState[0],   // 'v'isible / 'h'idden
+      foc: document.hasFocus() ? 1 : 0,
+    });
+    if (H.length > 4000) H.shift();
+  }, 250);
+  // Discrete visibility transitions, so a gap can be attributed even if it
+  // straddles two samples.
+  document.addEventListener('visibilitychange', () => {
+    window.__visLog.push({ t: Math.round(performance.now()), vis: document.visibilityState });
+  });
+  window.addEventListener('blur',  () => window.__visLog.push({ t: Math.round(performance.now()), vis: 'blur' }));
+  window.addEventListener('focus', () => window.__visLog.push({ t: Math.round(performance.now()), vis: 'focus' }));
+}
+window.dumpStalls = () => {
+  console.table(window.__stalls);
+  // Sampler gaps > 1s, with the heap delta across each gap.
+  const gaps = [];
+  for (let i = 1; i < window.__heapLog.length; i++) {
+    const a = window.__heapLog[i - 1], b = window.__heapLog[i];
+    if (b.t - a.t > 1000) {
+      gaps.push({ atMs: a.t, gapMs: b.t - a.t, jsMbBefore: a.jsMb, jsMbAfter: b.jsMb,
+                  jsDelta: b.jsMb - a.jsMb, wasmBefore: a.wasmMb, wasmAfter: b.wasmMb });
+    }
+  }
+  console.table(gaps);
+  console.table(window.__visLog);
+  // Sampler intervals during each gap: a RUN of ~1000ms intervals is Chrome
+  // throttling the tab's timers; a single long interval with the rest at
+  // 250ms is a real one-shot pause (GC or engine work).
+  const clamped = window.__heapLog.filter((s, i, a) => i && a[i].t - a[i-1].t > 900 && a[i].t - a[i-1].t < 1200).length;
+  const verdict = clamped > 3 ? 'TIMER THROTTLING (occlusion/hidden tab) — see __visLog'
+                : gaps.some(g => g.jsDelta < -50) ? 'GC pause (large JS heap drop across the gap)'
+                : gaps.some(g => g.wasmBefore !== g.wasmAfter) ? 'wasm heap growth (ALLOW_MEMORY_GROWTH copy)'
+                : window.__stalls.some(s => s.blame === 'wasm') ? 'engine work inside PortPushFrame'
+                : window.__stalls.length ? `${window.__stalls.length} brief browser-side hold(s), no heap drop / no throttling — minor GC or scheduler blip`
+                : 'no stalls recorded';
+  console.log('%c' + verdict, 'font-weight:bold');
+  const gp = window.__gpStats, upSec = performance.now()/1000;
+  if (window.__slowLoads.length) console.table(window.__slowLoads);
+  return { stalls: window.__stalls.length, gaps: gaps.length, clampedIntervals: clamped, verdict,
+           gamepadPollsPerSec: +(gp.calls/upSec).toFixed(1), padsConnected: gp.pads,
+           slowLoads: window.__slowLoads.length };
+};
+
+// ---- controller ports ---------------------------------------------------
+// Logical N64 port -> input device. The engine samples this once per game
+// tick (Module.readPorts) and treats a port with no device as unplugged, so
+// the character select spawns exactly one cursor per real player and
+// hot-plug just works (mnPlayersVSUpdateGate). Sources, in priority order:
+//   ?ports=<json>      the site's plan, one entry per port:
+//                      {kind:'gamepad',id,index} | {kind:'keyboard'} |
+//                      {kind:'none'} (explicitly closed) | null (free)
+//   (none)             auto: gamepads by index -> ports 1..n; the keyboard
+//                      takes a port only when no gamepad has one
+// Assignments are sticky for the session: a disconnected pad leaves its
+// port unplugged (nobody's fighter changes hands mid-match) and takes it
+// back on reconnect; a brand-new pad takes the lowest FREE port (never a
+// closed one). apply(plan) swaps in a new plan from Advanced options.
+window.controllerPorts = (() => {
+  const KIND = { AUTO: 0, NONE: 1, KEYBOARD: 2, GAMEPAD: 3 };
+  const BTN = { A: 0x8000, B: 0x4000, Z: 0x2000, START: 0x1000,
+                DUP: 0x0800, DDOWN: 0x0400, DLEFT: 0x0200, DRIGHT: 0x0100,
+                L: 0x0020, R: 0x0010, CUP: 0x0008, CDOWN: 0x0004, CLEFT: 0x0002, CRIGHT: 0x0001 };
+  const STICK_MAX = 80;      // OSContPad stick range
+  const STICK_DEADZONE = 0.15;
+  const C_STICK_THRESHOLD = 0.5;
+  const params = new URLSearchParams(location.search);
+  const listeners = new Set();
+  let ports = [null, null, null, null];
+  let engaged = false;
+  // LOCAL_PAD_FIRST: true once a bound key is pressed, so a pad that appears
+  // before then can still claim port 1.
+  let keyboardUsed = false;
+
+  const livePads = () => {
+    const out = [];
+    if (!navigator.getGamepads) return out;
+    for (const g of navigator.getGamepads()) if (g && g.connected) out.push(g);
+    return out;
+  };
+  const freePort = () => ports.findIndex((p) => p === null);
+  const padEntry = (g) => ({ kind: 'gamepad', id: g.id, index: g.index, lost: false, seen: true });
+  const isDevice = (p) => p && p.kind !== 'none';
+  const snapshot = () => ports.map((p) => (p ? { kind: p.kind, id: p.id, index: p.index, lost: !!p.lost } : null));
+  const notify = () => {
+    for (const fn of listeners) { try { fn(snapshot()); } catch (e) { console.warn('controllerPorts listener', e); } }
+  };
+
+  // LOCAL_PORTS: gamepads take ports 1..n in index order and the keyboard
+  // always holds a port too, so a keyboard + mouse session needs no setup and
+  // both input methods work side by side in local multiplayer. Port 1 is the
+  // one 1P mode is fixed to, so a pad the player reaches for *before* touching
+  // the keyboard takes it over (see gamepadconnected). The site's
+  // planControllerPorts (shared/controller-ports.js) still wins when the shell
+  // is given ?ports=.
+  function plan(pads) {
+    const next = [null, null, null, null];
+    let n = 0;
+    for (const g of pads.sort((a, b) => a.index - b.index)) {
+      if (n < 4) next[n++] = padEntry(g);
+    }
+    return next;
+  }
+
+  function mapKeyboard(slot) {
+    if (slot < 0 || ports.some((p) => p && p.kind === 'keyboard')) return;
+    ports[slot] = { kind: 'keyboard' };
+  }
+
+  function ensureSomeone() {
+    // The keyboard is always mapped: the engine spawns one character-select
+    // cursor per mapped port, and a KBM player must never have to claim one.
+    if (!ports.some(isDevice)) mapKeyboard(0);
+    mapKeyboard(freePort());
+  }
+
+  // LOCAL_PORTS_AUTO: a pad the plan does not name is not a pad the player
+  // wants gone. An automatic port (or a plan that names only some ports) must
+  // not unplug, or fail to show, a controller that is already connected, so
+  // every live pad the plan leaves out takes the lowest free port. Closed
+  // ports stay closed.
+  function fillUnnamed(next, live) {
+    for (const g of live.slice().sort((a, b) => a.index - b.index)) {
+      if (next.some((p) => p && p.kind === 'gamepad' && p.id === g.id && p.index === g.index)) continue;
+      const slot = next.findIndex((p) => p === null);
+      if (slot < 0) break;
+      next[slot] = padEntry(g);
+    }
+    return next;
+  }
+
+  // A plan from the site: keep the live state of pads we already track.
+  function adopt(parsed) {
+    const live = livePads();
+    return [0, 1, 2, 3].map((i) => {
+      const e = parsed[i];
+      if (!e || typeof e !== 'object') return null;
+      if (e.kind === 'keyboard') return { kind: 'keyboard' };
+      if (e.kind === 'none') return { kind: 'none' };
+      if (e.kind === 'gamepad' && typeof e.id === 'string') {
+        const index = Number(e.index) || 0;
+        const known = ports.find((p) => p && p.kind === 'gamepad' && p.id === e.id && p.index === index);
+        if (known) return known;
+        const visible = live.find((g) => g.id === e.id && g.index === index);
+        // Not seen by THIS document yet: the browser only exposes a pad
+        // to a frame after a button press in it, so trust the plan and
+        // let the first gamepadconnected fix up the index.
+        return { kind: 'gamepad', id: e.id, index, lost: false, seen: !!visible };
+      }
+      return null;
+    });
+  }
+
+  function init() {
+    const raw = params.get('ports');
+    let parsed = null;
+    if (raw) {
+      try { parsed = JSON.parse(raw); } catch (e) { console.warn('controllerPorts: bad ?ports=', e); }
+    }
+    ports = Array.isArray(parsed) ? fillUnnamed(adopt(parsed), livePads()) : plan(livePads());
+    ensureSomeone();
+    engaged = true;
+    console.log('controllerPorts:', snapshot());
+    notify();
+  }
+
+  window.addEventListener('gamepadconnected', (e) => {
+    const g = e.gamepad;
+    if (!g) return;
+    // A planned-but-unseen or lost pad with this id takes its port back
+    // (index may differ between the site's window and this frame).
+    const mine = ports.find((p) => p && p.kind === 'gamepad' && p.id === g.id &&
+                                   (p.lost || !p.seen || p.index === g.index));
+    if (mine) {
+      mine.index = g.index; mine.lost = false; mine.seen = true;
+      notify();
+      return;
+    }
+    // LOCAL_PAD_FIRST: a pad that shows up before the keyboard has been used
+    // takes port 1 (1P mode is fixed to it); the keyboard slides to the lowest
+    // free port so both devices stay playable.
+    if (!keyboardUsed && !ports.some((p) => p && p.kind === 'gamepad') &&
+        ports[0] && ports[0].kind === 'keyboard') {
+      ports[0] = padEntry(g);
+      mapKeyboard(freePort());
+      notify();
+      return;
+    }
+    const slot = freePort();
+    if (slot < 0) return;
+    ports[slot] = padEntry(g);
+    notify();
+  });
+  window.addEventListener('gamepaddisconnected', (e) => {
+    const g = e.gamepad;
+    if (!g) return;
+    const mine = ports.find((p) => p && p.kind === 'gamepad' && !p.lost && p.id === g.id && p.index === g.index);
+    if (mine) { mine.lost = true; notify(); }
+  });
+
+  // Live re-plan from the site's Advanced options while the game runs.
+  function apply(parsed) {
+    if (!Array.isArray(parsed)) return;
+    ports = fillUnnamed(adopt(parsed), livePads());
+    ensureSomeone();
+    notify();
+  }
+
+  // Standard-mapping Gamepad -> N64 pad, with the buttons resolved through
+  // the player's own table (see LOCAL_PAD_MAP). The two sticks are not
+  // remappable and never were: a stick is an axis, so the left stick is the N64
+  // stick and the right stick keeps its C buttons whatever a player does to the
+  // buttons. A button bound to a stick direction is the digital fallback for a
+  // pad with a broken stick, and only applies while the analog stick is idle,
+  // so the stick always wins.
+  function sample(g) {
+    const map = padMapFor(g.id);
+    const pressed = (i) => { const b = g.buttons[i]; return !!b && (b.pressed || b.value > 0.5); };
+    const axis = (i) => { const v = g.axes[i]; return typeof v === 'number' ? v : 0; };
+    let button = 0, dx = 0, dy = 0, walk = false;
+    const count = (g.buttons && g.buttons.length) || 0;
+    for (let i = 0; i < count; i++) {
+      if (!pressed(i)) continue;
+      const action = map.get(i);
+      if (!action) continue;
+      if (action === 'UP') dy += 1; else if (action === 'DOWN') dy -= 1;
+      else if (action === 'LEFT') dx -= 1; else if (action === 'RIGHT') dx += 1;
+      else if (action === 'WALK') walk = true;
+      else button |= BTN[action];
+    }
+    const rx = axis(2), ry = axis(3);
+    if (ry < -C_STICK_THRESHOLD) button |= BTN.CUP;
+    if (ry > C_STICK_THRESHOLD) button |= BTN.CDOWN;
+    if (rx < -C_STICK_THRESHOLD) button |= BTN.CLEFT;
+    if (rx > C_STICK_THRESHOLD) button |= BTN.CRIGHT;
+    let x = axis(0), y = axis(1);
+    const len = Math.hypot(x, y);
+    if (len < STICK_DEADZONE) { x = 0; y = 0; }
+    else { const s = Math.min(1, (len - STICK_DEADZONE) / (1 - STICK_DEADZONE)) / len; x *= s; y *= s; }
+    // WALK is the port's walk modifier here too, so a pad button can hold it.
+    const walkScale = walk ? 0.42 : 1;
+    if (x || y) {
+      return { button, sx: Math.round(x * walkScale * STICK_MAX), sy: Math.round(-y * walkScale * STICK_MAX) };
+    }
+    const mag = walkScale * STICK_MAX / (dx && dy ? Math.SQRT2 : 1);
+    return { button, sx: Math.round(Math.sign(dx) * mag), sy: Math.round(Math.sign(dy) * mag) };
+  }
+
+  // Keyboard -> N64 pad, resolved in JS. Binds by PHYSICAL key (event.code)
+  // so the right-hand cluster stays under the fingers on every layout; the
+  // launcher's control editor labels each position with the character the
+  // player's own layout prints there (Dvorak sees C V P G S where QWERTY
+  // sees J K L I O). Mirrors libultraship's defaults — WASD/arrows stick,
+  // J=A K=B L=Z I=L O=R, Space/Enter=Start, U=C-up, TFGH=D-pad — plus the
+  // mouse buttons the shell feeds into the same pad sampler.
+  //
+  // LOCAL_KBM_MAP: the map is data, not code, so a player can change it. The
+  // launcher's control editor owns the saved plan; it arrives here as
+  // ?binds=<json> and is re-sent over postMessage when a key changes
+  // mid-session, so a remap never needs a reload. web/bindings.js is the
+  // editor's copy of the table below; tests/bindings.cjs fails if the two
+  // ever drift apart.
+  const ACTIONS = ['A', 'B', 'Z', 'L', 'R', 'START',
+                   'CUP', 'CDOWN', 'CLEFT', 'CRIGHT',
+                   'DUP', 'DDOWN', 'DLEFT', 'DRIGHT',
+                   'UP', 'DOWN', 'LEFT', 'RIGHT', 'WALK'];
+  const MODIFIERS = { WALK: true };  // WALK is the stick modifier, not a button
+  const MAX_KEYS_PER_ACTION = 4;
+  const DEFAULT_BINDINGS = {
+    "A": ["KeyJ", "Mouse0"],
+    "B": ["KeyK", "Mouse2"],
+    "Z": ["KeyE", "Mouse1"],
+    "L": ["KeyI"],
+    "R": ["ShiftLeft", "ShiftRight", "KeyL"],
+    "START": ["Enter", "NumpadEnter"],
+    "CUP": ["Space", "KeyU"],
+    "CDOWN": [],
+    "CLEFT": [],
+    "CRIGHT": [],
+    "DUP": ["KeyT"],
+    "DDOWN": ["KeyG"],
+    "DLEFT": ["KeyF"],
+    "DRIGHT": ["KeyH"],
+    "UP": ["KeyW", "ArrowUp"],
+    "DOWN": ["KeyS", "ArrowDown"],
+    "LEFT": ["KeyA", "ArrowLeft"],
+    "RIGHT": ["KeyD", "ArrowRight"],
+    "WALK": ["AltLeft", "AltRight"]
+  };
+  const KEY_CODE = /^(?:Mouse[0-4]|[^\s"<>]{1,24})$/;
+  const defaultsFor = (action) => DEFAULT_BINDINGS[action].slice();
+
+  // A saved plan can be stale, hand-edited or truncated: a value that is not a
+  // physical key code is dropped, and an action whose list we cannot read at
+  // all falls back to its shipped keys, so a bad plan can never leave a player
+  // unable to press start.
+  function normalizeBindings(spec) {
+    const source = spec && typeof spec === 'object' && spec.actions && typeof spec.actions === 'object'
+      ? spec.actions : spec;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+    const actions = {};
+    for (const action of ACTIONS) {
+      const raw = source[action];
+      const keys = [];
+      if (Array.isArray(raw)) {
+        for (const key of raw) {
+          if (KEY_CODE.test(key) && !keys.includes(key) && keys.length < MAX_KEYS_PER_ACTION) keys.push(key);
+        }
+      }
+      actions[action] = Array.isArray(raw) ? keys : defaultsFor(action);
+    }
+    return { v: 1, actions };
+  }
+
+  const parseBindPlan = (raw) => {
+    if (typeof raw !== 'string' || !raw) return null;
+    try { return JSON.parse(raw); } catch (e) { console.warn('controllerPorts: bad ?binds=', e); return null; }
+  };
+
+  let bindings = normalizeBindings(parseBindPlan(params.get('binds'))) || normalizeBindings(DEFAULT_BINDINGS);
+  let KEY_MAP = {};
+  let WALK_KEYS = [];
+  let boundKeys = new Set();
+  function rebuildKeyMap() {
+    KEY_MAP = {};
+    for (const action of ACTIONS) {
+      if (MODIFIERS[action]) continue;
+      for (const key of bindings.actions[action]) if (!(key in KEY_MAP)) KEY_MAP[key] = action;
+    }
+    WALK_KEYS = bindings.actions.WALK.slice();
+    boundKeys = new Set([...Object.keys(KEY_MAP), ...WALK_KEYS]);
+  }
+  // The launcher's editor owns the saved plan; this is its live end. It also
+  // reports the new map back (notify -> postState) so the editor shows what the
+  // engine actually reads rather than what it hoped to write.
+  function setBindings(spec) {
+    const next = normalizeBindings(spec);
+    if (!next) return false;
+    bindings = next;
+    rebuildKeyMap();
+    notify();
+    return true;
+  }
+  function bindingSpec() {
+    const actions = {};
+    for (const action of ACTIONS) actions[action] = bindings.actions[action].slice();
+    return { v: 1, actions };
+  }
+  rebuildKeyMap();
+  // LOCAL_PAD_MAP: the buttons each pad drives, as data instead of a fixed
+  // mapping. web/bindings.js holds the editor's copy of DEFAULT_PAD_BINDINGS
+  // and tests/bindings.cjs fails if the two drift apart. A table is keyed by
+  // Gamepad.id, so a remap follows the controller rather than the port it
+  // happened to land on, and two pads of one model share a table — the browser
+  // gives us no finer identity than the id (the index changes every session).
+  const DEFAULT_PAD_BINDINGS = {
+    "A": [0], "B": [1], "Z": [6], "L": [4], "R": [5, 7], "START": [9],
+    "CUP": [2, 3], "CDOWN": [], "CLEFT": [], "CRIGHT": [],
+    "DUP": [12], "DDOWN": [13], "DLEFT": [14], "DRIGHT": [15],
+    "UP": [], "DOWN": [], "LEFT": [], "RIGHT": [], "WALK": []
+  };
+  const MAX_BUTTONS_PER_ACTION = 4;
+  const MAX_PADS = 16;
+  const MAX_BUTTON_INDEX = 31;
+  const padDefaultsFor = (action) => DEFAULT_PAD_BINDINGS[action].slice();
+
+  // Read the way the key table is: a value that is not a button index is
+  // dropped, duplicates collapse, the list is capped, and an action we cannot
+  // read at all keeps the shipped buttons.
+  function normalizePadActions(spec) {
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return null;
+    const actions = {};
+    for (const action of ACTIONS) {
+      const raw = spec[action];
+      const buttons = [];
+      if (Array.isArray(raw)) {
+        for (const button of raw) {
+          if (Number.isInteger(button) && button >= 0 && button <= MAX_BUTTON_INDEX &&
+              !buttons.includes(button) && buttons.length < MAX_BUTTONS_PER_ACTION) buttons.push(button);
+        }
+      }
+      actions[action] = Array.isArray(raw) ? buttons : padDefaultsFor(action);
+    }
+    return actions;
+  }
+
+  function normalizePadBindings(spec) {
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return null;
+    const table = new Map();
+    for (const id of Object.keys(spec)) {
+      if (typeof id !== 'string' || !id || id.length > 64) continue;
+      const actions = normalizePadActions(spec[id]);
+      if (actions) table.set(id, actions);
+      if (table.size >= MAX_PADS) break;
+    }
+    return table;
+  }
+
+  // Button index -> action for one pad. The sampler asks for this on every game
+  // tick, so it is built once per table and rebuilt only when that table
+  // changes. A saved table is always complete, so an action a player emptied
+  // stays empty; only a pad we have no entry for falls back to the defaults.
+  function buildPadMap(actions) {
+    const map = new Map();
+    for (const action of ACTIONS) {
+      for (const button of actions[action]) if (!map.has(button)) map.set(button, action);
+    }
+    return map;
+  }
+  const defaultPadMap = buildPadMap(DEFAULT_PAD_BINDINGS);
+  const parsedPlan = parseBindPlan(params.get('binds'));
+  let padBindings = normalizePadBindings(parsedPlan && parsedPlan.pads) || new Map();
+  let padMaps = new Map();
+  function padMapFor(id) {
+    const saved = padBindings.get(id);
+    if (!saved) return defaultPadMap;
+    let map = padMaps.get(id);
+    if (!map) { map = buildPadMap(saved); padMaps.set(id, map); }
+    return map;
+  }
+  // The live end of the editor's pad table. A plan that carries no pad table
+  // leaves the current one alone, so remapping a key can never wipe a
+  // controller's buttons.
+  function setPadBindings(spec) {
+    const next = normalizePadBindings(spec);
+    if (!next) return false;
+    padBindings = next;
+    padMaps = new Map();
+    notify();
+    return true;
+  }
+  function padBindingSpec() {
+    const pads = Object.create(null);
+    for (const [id, actions] of padBindings) {
+      const copy = {};
+      for (const action of ACTIONS) copy[action] = actions[action].slice();
+      pads[id] = copy;
+    }
+    return { v: 1, pads };
+  }
+  const held = new Set();
+  let virtualStick = null;
+  function setVirtualStick(axes) {
+    const clampAxis = (value) => Number.isFinite(value)
+      ? Math.max(-STICK_MAX, Math.min(STICK_MAX, Math.round(value))) : 0;
+    virtualStick = axes == null ? null : { x: clampAxis(axes.x), y: clampAxis(axes.y) };
+  }
+  function releaseKeyboard() { held.clear(); virtualStick = null; }
+  // Synthetic events may carry only a key: map a letter back to its code.
+  const keyName = (e) => {
+    if (typeof e.code === 'string' && e.code) return e.code;
+    const k = typeof e.key === 'string' ? e.key : '';
+    if (k === ' ') return 'Space';
+    return k.length === 1 ? 'Key' + k.toUpperCase() : k;
+  };
+  // No isComposing guard: bindings are physical, so an IME (Pinyin etc.)
+  // composing over the canvas must not swallow the press.
+  window.addEventListener('keydown', (e) => {
+    const name = keyName(e);
+    held.add(name);
+    if (KEY_MAP[name]) keyboardUsed = true;
+  }, true);
+  window.addEventListener('keyup', (e) => { held.delete(keyName(e)); }, true);
+  // LOCAL_KBM_INPUT: mouse state enters the same native controller sampler, so
+  // left/right/middle click are A/B/Z on player 1 without any emulator layer.
+  // boundKeys is rebuilt with the map, so a rebound key is still swallowed
+  // before the browser can scroll or focus something with it.
+  window.addEventListener('keydown', e => { if (boundKeys.has(e.code)) e.preventDefault(); }, true);
+  document.getElementById('canvas').addEventListener('pointerdown', e => {
+    if (e.pointerType !== 'mouse') return;
+    e.preventDefault(); held.add('Mouse' + e.button);
+    document.getElementById('canvas').setPointerCapture?.(e.pointerId);
+    document.getElementById('canvas').focus();
+  });
+  window.addEventListener('pointerup', e => {
+    if (e.pointerType === 'mouse') held.delete('Mouse' + e.button);
+  });
+  window.addEventListener('pointercancel', releaseKeyboard);
+  window.addEventListener('blur', releaseKeyboard);
+  window.addEventListener('pagehide', releaseKeyboard);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeyboard(); });
+
+  function sampleKeyboard() {
+    let button = 0, x = 0, y = 0;
+    for (const k of held) {
+      const b = KEY_MAP[k];
+      if (!b) continue;
+      if (b === 'UP') y += 1; else if (b === 'DOWN') y -= 1;
+      else if (b === 'LEFT') x -= 1; else if (b === 'RIGHT') x += 1;
+      else button |= BTN[b];
+    }
+    x = Math.sign(x); y = Math.sign(y);
+    // WALK is the port's walk modifier: a reduced stick magnitude still walks
+    // in game while tap-and-hold reaches a full dash. It is remappable, so ask
+    // the live map instead of naming a key.
+    let walk = false;
+    for (const key of WALK_KEYS) if (held.has(key)) { walk = true; break; }
+    const magnitude = (walk ? 0.42 : 1) * STICK_MAX / (x && y ? Math.SQRT2 : 1);
+    return { button, sx: virtualStick ? virtualStick.x : Math.round(x * magnitude),
+                     sy: virtualStick ? virtualStick.y : Math.round(y * magnitude) };
+  }
+
+  // LOCAL_HEAP_VIEW: the glue hands this shell the pointer its C++ sample
+  // buffer lives at, so writing through a 32-bit view of the wasm heap is how
+  // every input in this document reaches the game. The glue keeps those views
+  // in module scope and only publishes the ones the build asks it to
+  // (CMakeLists exports FS,callMain), so `Module.HEAP32` alone is undefined
+  // here and the sampler used to return before writing a single byte — the
+  // ports then read as unplugged and the game played through its own SDL and
+  // keyboard mappings instead. Ask for the view this build actually publishes:
+  // the module first, then the glue's own global, which is live even after the
+  // heap grows because the glue reassigns it before any tick can run. A missing
+  // view means the engine is not up yet; the port keeps reading as unplugged
+  // until it is.
+  const heapView = () => {
+    if (typeof Module !== 'undefined' && Module && Module.HEAP32) return Module.HEAP32;
+    if (typeof HEAP32 !== 'undefined' && HEAP32) return HEAP32;
+    return null;
+  };
+
+  // Engine entry point: fill 4 x {kind, button, stick_x, stick_y} int32s.
+  function readPorts(ptr) {
+    if (!engaged) return;
+    const H = heapView();
+    if (!H) return;
+    const base = ptr >> 2;
+    const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (let i = 0; i < 4; i++) {
+      const p = ports[i];
+      let kind = KIND.NONE, button = 0, sx = 0, sy = 0;
+      if (p && p.kind === 'keyboard') {
+        kind = KIND.KEYBOARD;
+        ({ button, sx, sy } = sampleKeyboard());
+      } else if (p && p.kind === 'gamepad' && !p.lost) {
+        kind = KIND.GAMEPAD;
+        const g = gps[p.index];
+        if (g && g.connected && g.id === p.id) ({ button, sx, sy } = sample(g));
+      }
+      H[base + i * 4] = kind;
+      H[base + i * 4 + 1] = button;
+      H[base + i * 4 + 2] = sx;
+      H[base + i * 4 + 3] = sy;
+    }
+  }
+
+  // LOCAL_KBM_MAP live channel: the launcher owns the saved controls, so it
+  // re-sends a plan when the player edits a key mid-session, and this shell
+  // reports back the ports, key map and per-pad button tables it is actually
+  // reading. One message carries both tables, and each is validated on its own,
+  // so a pad table the shell cannot read still leaves the key map applied.
+  function postState() {
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: 'smash64:state', version: 'c5a89c4fd958',
+                                    ports: snapshot(), bindings: bindingSpec(),
+                                    padBindings: padBindingSpec() }, '*');
+      }
+    } catch (e) { /* nobody is listening */ }
+  }
+  window.addEventListener('message', (e) => {
+    const data = e && e.data;
+    if (!data || (window.parent && window.parent !== window && e.source !== window.parent)) return;
+    if (data.type === 'smash64:bindings') {
+      setBindings(data.bindings);
+      setPadBindings(data.bindings && data.bindings.pads);
+    }
+    else if (data.type === 'smash64:ports') apply(data.ports);
+  });
+  listeners.add(postState);
+  init();
+  return {
+    readPorts,
+    sampleKeyboard,
+    setVirtualStick,
+    releaseKeyboard,
+    keyboardUsed: () => keyboardUsed,
+    snapshot,
+    // Changeable controls: the launcher reads and writes the live map through
+    // these (see web/bindings.js for the editor's copy of the same table).
+    setBindings,
+    bindings: bindingSpec,
+    apply,
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+  };
+})();
+
+// ---- on-demand roster staging ------------------------------------------
+// Module.__stageUrls: MEMFS path -> URL, registered by the roster boot path.
+// Module.ensureStaged(path): Asyncify suspends the native caller until the
+// file is ready. Background prefetch and demand loads share one request.
+const stageCache = new Map();
+const stagePending = new Map();
+
+function fetchStaged(path) {
+  if (stageCache.has(path)) return Promise.resolve(stageCache.get(path));
+  if (stagePending.has(path)) return stagePending.get(path);
+  const url = Module.__stageUrls?.[path];
+  const pending = fetch(url).then(async (r) => {
+    if (!r.ok) throw new Error(`fetch ${url}: ${r.status}`);
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    stageCache.set(path, bytes);
+    return bytes;
+  }).finally(() => stagePending.delete(path));
+  stagePending.set(path, pending);
+  return pending;
+}
+
+function stageWrite(path, bytes) {
+  const dir = path.substring(0, path.lastIndexOf('/')) || '/';
+  FS.mkdirTree(dir);
+  FS.writeFile(path, bytes);
+}
+
+async function stageNow(path) {
+  if (FS.analyzePath(path).exists) return true;
+  const url = Module.__stageUrls?.[path];
+  if (!url) return false;
+  const bytes = await fetchStaged(path);
+  stageWrite(path, bytes);
+  stageCache.delete(path);
+  return true;
+}
+
+function prefetchStaged(paths, concurrency = 3) {
+  const queue = paths.filter((p) => Module.__stageUrls?.[p]);
+  let active = 0;
+  const next = () => {
+    while (active < concurrency && queue.length) {
+      const path = queue.shift();
+      if (FS.analyzePath(path).exists || stageCache.has(path)) continue;
+      active++;
+      fetchStaged(path)
+        .catch((e) => console.warn(`prefetch ${path} failed:`, e.message))
+        .finally(() => { active--; next(); });
+    }
+  };
+  next();
+}
+
+window.__stageStats = { cached: 0, async: 0, asyncMs: 0 };
+async function ensureStaged(path) {
+  if (FS.analyzePath(path).exists) return true;
+  if (!Module.__stageUrls?.[path]) return false;
+  const cached = stageCache.has(path);
+  const start = performance.now();
+  try {
+    const bytes = await fetchStaged(path);
+    stageWrite(path, bytes);
+    stageCache.delete(path);
+    if (cached) window.__stageStats.cached++;
+    else {
+      window.__stageStats.async++;
+      window.__stageStats.asyncMs += performance.now() - start;
+    }
+    return true;
+  } catch (e) {
+    console.warn(`ensureStaged ${path}:`, e.message);
+    return false;
+  }
+}
+
+var Module = {
+  canvas: document.getElementById('canvas'),
+  ensureStaged,
+  arguments: [],
+  readPorts: (ptr) => window.controllerPorts.readPorts(ptr),
+  preRun: [async function () {
+    // MUST be registered synchronously, before any await in this
+    // function — an await suspends the async preRun and the runtime
+    // proceeds to main() unless a dependency is already pending.
+    addRunDependency('battleship-files');
+    // ASan builds only (no-op otherwise): report every error and keep
+    // running instead of aborting on the first one.
+    if (typeof ENV !== 'undefined') {
+      ENV.ASAN_OPTIONS = 'halt_on_error=0:detect_container_overflow=0';
+    }
+    // Dev harness: every SSB64_* query param becomes an environment
+    // variable, so the browser build keeps the native hook contract
+    // (?SSB64_BOOT_BATTLE=0,8,4 etc). `inject` is the one alias with
+    // extra behavior: it names a bundle URL, fetched into MEMFS, and
+    // sets SSB64_INJECT_BUNDLE to the staged path.
+    const params = new URLSearchParams(location.search);
+    // Keep the game ticking while the document is hidden (the pacer parks
+    // otherwise, see port_wait_display_frame). Implied for unattended
+    // capture/replay runs; ?bg=1 or localStorage 'opensmash.runHidden'='1'
+    // for agents testing in a hidden browser pane; toggle any time via
+    // window.__runHidden on the engine frame.
+    let runHiddenStored = null;
+    try { runHiddenStored = localStorage.getItem('opensmash.runHidden'); } catch (_) {}
+    window.__runHidden = params.get('bg') === '1' || runHiddenStored === '1' ||
+      params.has('capture') || params.has('replay') || params.has('SSB64_TRAILER_RECORD');
+    for (const [k, v] of params) {
+      if (k.startsWith('SSB64_') && typeof ENV !== 'undefined') ENV[k] = v;
+    }
+    // Capture / eval runs stay tick-exact: no engine VS card before battles.
+    if (params.has('capture') && typeof ENV !== 'undefined' && !params.has('SSB64_VS_INTRO')) ENV.SSB64_VS_INTRO = '0';
+    try {
+      // Stage the engine's required archives before any optional fighter
+      // extras. A missing portrait/voice must never start main() with an
+      // empty MEMFS and fall through to the desktop first-run wizard.
+      performance.mark('shell:prerun');
+      // Fetched once by the early script below; reuse instead of refetching.
+      const manifest = await window.__engineManifest;
+      let done = 0;
+      await Promise.all(manifest.files.map(async (f) => {
+        const resp = await fetch(f.url);
+        if (!resp.ok) throw new Error(`fetch ${f.url}: ${resp.status}`);
+        const data = new Uint8Array(await resp.arrayBuffer());
+        // Ensure parent directories exist, then write the file.
+        const dir = f.path.substring(0, f.path.lastIndexOf('/')) || '/';
+        FS.mkdirTree(dir);
+        FS.writeFile(f.path, data);
+        setStatus(`files ${++done}/${manifest.files.length}`);
+      }));
+
+      // LOCAL_ENV_FORWARD: any ?SSB64_* query parameter becomes an environment
+      // variable for the port, so the engine's own diagnostics (SSB64_LOG_INFO,
+      // SSB64_RENDER_DIAG, SSB64_DUMP_FILE_ID, ...) work from a URL without
+      // editing the shell.
+      if (typeof ENV !== 'undefined') {
+        for (const [key, value] of params) if (key.startsWith('SSB64_')) ENV[key] = value;
+      }
+
+      // LOCAL_SRAM_RESTORE: restore the native game's SRAM file before main().
+      // The key is namespaced per ROM region (?savekey=, set by the launcher)
+      // and mirrored into globalThis so port_save.cpp's EM_JS persists the
+      // save under the same key: a European save is never restored by the US
+      // game, and vice versa.
+      const saveKey = params.get('savekey') || 'smash64.native.sram.us';
+      globalThis.__smash64SramKey = saveKey;
+      if (typeof ENV !== 'undefined') ENV.SSB64_SAVE_PATH = '/ssb64_save.bin';
+      const savedSram = localStorage.getItem(saveKey);
+      if (savedSram) {
+        const raw = atob(savedSram);
+        FS.writeFile('/ssb64_save.bin', Uint8Array.from(raw, c => c.charCodeAt(0)));
+      }
+
+      // The ROM-derived archive is not part of the package: build it in the
+      // browser from the ROM the site stored in IndexedDB (or reuse the copy
+      // built earlier for this recipe). Dev packages made with PACKAGE_O2R=1
+      // still ship it in the manifest, in which case this is a no-op.
+      if (!FS.analyzePath('/BattleShip.o2r').exists) {
+        // Started by the early script below, before BattleShip.js began
+        // downloading, so Torch had the CPU to itself for as long as possible.
+        const { writeArchive } = await import('./rom-extract.js?v=c5a89c4fd958');
+        const staged = await window.__archivePromise;
+        writeArchive(FS, staged.bytes, staged.extras);
+        performance.mark('shell:archive-staged');
+        console.warn('[shell] BattleShip.o2r staged from ROM:', staged.source, staged.sha1, staged.ms ? Math.round(staged.ms) + 'ms' : '');
+      }
+
+      // The per-fighter files (mesh bundle, select-screen UI, announcer
+      // voice) are independent: fetch them together instead of three round
+      // trips back to back. Each fetch is bounded so a hung request fails
+      // the launch with a clear status instead of a frame stuck on
+      // "files 10/10". Only the mesh bundle is required.
+      const FIGHTER_FETCH_TIMEOUT_MS = 60000;
+      const fetchFighterFile = async (url, what) => {
+        setStatus('fighter files…');
+        let resp;
+        try {
+          resp = await fetch(url, { signal: AbortSignal.timeout(FIGHTER_FETCH_TIMEOUT_MS) });
+        } catch (e) {
+          throw new Error(`fighter ${what} ${e.name === 'TimeoutError' ? 'timed out' : 'failed'} (${url}: ${e.message})`);
+        }
+        if (!resp.ok) throw new Error(`fighter ${what} unavailable (${url}: ${resp.status})`);
+        return new Uint8Array(await resp.arrayBuffer());
+      };
+      const optionalFighterFile = async (param, memfsPath, envKey, what) => {
+        if (!params.has(param)) return;
+        try {
+          FS.writeFile(memfsPath, await fetchFighterFile(params.get(param), what));
+          if (typeof ENV !== 'undefined') ENV[envKey] = memfsPath;
+        } catch (e) {
+          console.warn(`optional ${e.message}`);
+        }
+      };
+      const fighterFetches = [
+        optionalFighterFile('inject_ui', '/inject.osbui', 'SSB64_INJECT_UI', 'UI'),
+        optionalFighterFile('inject_voice', '/inject-voice.wav', 'SSB64_INJECT_VOICE', 'voice'),
+      ];
+      if (params.has('inject')) {
+        fighterFetches.push(fetchFighterFile(params.get('inject'), 'bundle')
+          .then((bytes) => FS.writeFile('/inject.osb', bytes)));
+      }
+      if (params.has('capture')) {
+        // frame-exact capture: the engine calls Module.onGameTick(frame)
+        // after every completed game tick; grab the canvas at target ticks
+        // and upload. Tick-based, so capture stalls can't desync replays.
+        const [cs, ce, cstep] = params.get('capture').split(':').map(Number);
+        const capname = params.get('capname') || 'cap';
+        const targets = new Set();
+        for (let f = cs; f < ce; f += cstep) targets.add(f);
+        const total = targets.size;
+        const pend = [];
+        // Inline capture on the exact tick: valid in ANY tab state because
+        // the head script forced preserveDrawingBuffer=true on the GL
+        // context for capture runs (otherwise the compositor clears the
+        // buffer between tasks and reads come back black in visible tabs;
+        // rAF-based reads are no better — rAF never fires in hidden tabs).
+        Module.onGameTick = (f) => {
+          if (!targets.delete(f)) return;
+          const d = Module.canvas.toDataURL('image/png');
+          pend.push(fetch('/upload', { method: 'POST', body: d,
+            headers: { 'X-Capture-Name': capname + '/frame_' + f + '.png' } }));
+          if (targets.size % 25 === 0) setStatus(`capturing ${total - targets.size}/${total}`);
+          if (targets.size === 0) {
+            Promise.all(pend).then(() => {
+              setStatus(`CAPTURE DONE (${total} frames)`);
+              document.title = 'CAPTURE-DONE';
+            });
+          }
+        };
+      }
+      if (params.has('replay')) {
+        const url = params.get('replay');
+        const resp = await fetch(url, { cache: 'no-cache' });
+        if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status}`);
+        FS.writeFile('/replay.rpl', new Uint8Array(await resp.arrayBuffer()));
+        if (typeof ENV !== 'undefined') ENV.SSB64_REPLAY_PLAY = '/replay.rpl';
+      }
+      await Promise.all(fighterFetches);
+      if (params.has('inject')) {
+        if (typeof ENV !== 'undefined') {
+          ENV.SSB64_INJECT_BUNDLE = '/inject.osb';
+          ENV.SSB64_INJECT_FKIND = params.get('fkind') || '0';
+          // default player 0: in mirror matches (eval runs) BOTH fighters
+          // share the inject fkind, and an unpinned attach lets P2 steal
+          // ownership, leaving P1 blanked and invisible.
+          ENV.SSB64_INJECT_PLAYER = params.get('player') || '0';
+          if (params.get('inject_name')) ENV.SSB64_INJECT_NAME = params.get('inject_name');
+          // results-screen "<NAME> WINS!" letters (A-Z); falls back to inject_name
+          if (params.get('inject_short')) ENV.SSB64_INJECT_SHORT = params.get('inject_short');
+        }
+      }
+      // Targeted direct-match roster: each repeated inject_player value is
+      // JSON describing one CPU slot and its fighter assets. Unlike roster=1,
+      // this stages only the two opponents selected for this match. The native
+      // roster binds by player, so several custom fighters can safely share the
+      // same vanilla skeleton/fkind without replacing one another.
+      if (params.has('inject_player')) {
+        const rows = [];
+        const playerChars = ['-', '-', '-', '-'];
+        await Promise.all(params.getAll('inject_player').map(async (raw) => {
+          const entry = JSON.parse(raw);
+          const player = Number(entry.player);
+          const fkind = Number(entry.fkind);
+          const slug = String(entry.slug || '');
+          if (!Number.isInteger(player) || player < 0 || player > 3 ||
+              !Number.isInteger(fkind) || fkind < 0 || fkind > 11 ||
+              !/^[a-z0-9]+$/.test(slug) || !entry.bundleUrl) {
+            throw new Error('invalid inject_player entry');
+          }
+
+          const bundlePath = `/direct-player-${player}.osb`;
+          const bundleResponse = await fetch(entry.bundleUrl);
+          if (!bundleResponse.ok) {
+            throw new Error(`fetch ${entry.bundleUrl}: ${bundleResponse.status}`);
+          }
+          FS.writeFile(bundlePath, new Uint8Array(await bundleResponse.arrayBuffer()));
+
+          let uiPath = '';
+          if (entry.uiUrl) {
+            const response = await fetch(entry.uiUrl);
+            if (response.ok) {
+              uiPath = `/direct-player-${player}.osbui`;
+              FS.writeFile(uiPath, new Uint8Array(await response.arrayBuffer()));
+            } else {
+              console.warn(`optional fighter UI unavailable (${entry.uiUrl}: ${response.status})`);
+            }
+          }
+
+          let voicePath = '';
+          if (entry.voiceUrl) {
+            const response = await fetch(entry.voiceUrl);
+            if (response.ok) {
+              voicePath = `/direct-player-${player}.wav`;
+              FS.writeFile(voicePath, new Uint8Array(await response.arrayBuffer()));
+            } else {
+              console.warn(`optional fighter voice unavailable (${entry.voiceUrl}: ${response.status})`);
+            }
+          }
+
+          const short = String(entry.short || slug)
+            .toUpperCase()
+            .replace(/[^A-Z]/g, '')
+            .slice(0, 10);
+          rows.push({
+            player,
+            line: [slug, fkind, bundlePath, uiPath, voicePath, short, fkind,
+                   String(entry.name || '').replace(/[|\n\r]/g, ' ')].join('|'),
+          });
+          playerChars[player] = slug;
+        }));
+        rows.sort((left, right) => left.player - right.player);
+        if (rows.length && typeof ENV !== 'undefined') {
+          FS.writeFile('/direct-roster.txt', new TextEncoder().encode(
+            rows.map(({ line }) => line).join('\n') + '\n',
+          ));
+          ENV.SSB64_ROSTER_FILE = '/direct-roster.txt';
+          ENV.SSB64_PLAYER_CHARS = playerChars.join(',');
+        }
+      }
+      // Full-boot trailer roster: one independently staged character for
+      // each requested opening card. All twelve native skeleton targets are
+      // accepted here; the launch config decides which cards stay vanilla.
+      // Invalid, unavailable, or duplicate entries are skipped per card,
+      // leaving that card's original fighter, title, portrait, and voice
+      // intact while the rest of the intro still boots.
+      if (params.has('intro_character')) {
+        const claimedFkinds = new Set();
+        const entries = [];
+        for (const raw of params.getAll('intro_character')) {
+          try {
+            const entry = JSON.parse(raw);
+            const fkind = Number(entry.fkind);
+            const base = Number(entry.base ?? fkind);
+            const slug = String(entry.slug || '');
+            if (!Number.isInteger(fkind) || fkind < 0 || fkind >= 12 ||
+                !Number.isInteger(base) || base < 0 || base >= 12 ||
+                claimedFkinds.has(fkind) || !/^[a-z0-9]+$/.test(slug) ||
+                !entry.bundleUrl) {
+              throw new Error('invalid or duplicate card');
+            }
+            claimedFkinds.add(fkind);
+            entries.push({ ...entry, fkind, base, slug });
+          } catch (error) {
+            console.warn(`intro card kept vanilla (${error.message})`);
+          }
+        }
+
+        const stagedRows = (await Promise.all(entries.map(async (entry) => {
+          const prefix = `/intro-fk${entry.fkind}`;
+          try {
+            const bundleResponse = await fetch(entry.bundleUrl);
+            if (!bundleResponse.ok) {
+              throw new Error(`fetch ${entry.bundleUrl}: ${bundleResponse.status}`);
+            }
+            FS.writeFile(`${prefix}.osb`, new Uint8Array(await bundleResponse.arrayBuffer()));
+
+            let uiPath = '';
+            if (entry.uiUrl) {
+              try {
+                const response = await fetch(entry.uiUrl);
+                if (response.ok) {
+                  uiPath = `${prefix}.osbui`;
+                  FS.writeFile(uiPath, new Uint8Array(await response.arrayBuffer()));
+                } else {
+                  console.warn(`intro UI kept vanilla (${entry.uiUrl}: ${response.status})`);
+                }
+              } catch (error) {
+                console.warn(`intro UI kept vanilla (${entry.uiUrl}: ${error.message})`);
+              }
+            }
+
+            let voicePath = '';
+            if (entry.voiceUrl) {
+              try {
+                const response = await fetch(entry.voiceUrl);
+                if (response.ok) {
+                  voicePath = `${prefix}.wav`;
+                  FS.writeFile(voicePath, new Uint8Array(await response.arrayBuffer()));
+                } else {
+                  console.warn(`intro voice kept vanilla (${entry.voiceUrl}: ${response.status})`);
+                }
+              } catch (error) {
+                console.warn(`intro voice kept vanilla (${entry.voiceUrl}: ${error.message})`);
+              }
+            }
+
+            // Portrait PNG for the opening's baked character art (the Sector
+            // cockpit's Fox face); without it that art stays vanilla.
+            let portraitPath = '';
+            if (entry.portraitUrl) {
+              try {
+                const response = await fetch(entry.portraitUrl);
+                if (response.ok) {
+                  portraitPath = `${prefix}.png`;
+                  FS.writeFile(portraitPath, new Uint8Array(await response.arrayBuffer()));
+                } else {
+                  console.warn(`intro portrait kept vanilla (${entry.portraitUrl}: ${response.status})`);
+                }
+              } catch (error) {
+                console.warn(`intro portrait kept vanilla (${entry.portraitUrl}: ${error.message})`);
+              }
+            }
+
+            const short = String(entry.short || entry.slug)
+              .toUpperCase()
+              .replace(/[^A-Z]/g, '')
+              .slice(0, 10);
+            return [entry.slug, entry.fkind, `${prefix}.osb`, uiPath,
+                    voicePath, short, entry.base, '', portraitPath].join('|');
+          } catch (error) {
+            console.warn(`intro fk${entry.fkind} kept vanilla (${error.message})`);
+            return null;
+          }
+        }))).filter(Boolean);
+
+        if (stagedRows.length && typeof ENV !== 'undefined') {
+          FS.writeFile('/intro-roster.txt', new TextEncoder().encode(
+            stagedRows.join('\n') + '\n',
+          ));
+          ENV.SSB64_ROSTER_FILE = '/intro-roster.txt';
+          ENV.SSB64_ROSTER_PAGE = '1';
+        }
+        console.log(`intro roster: staged ${stagedRows.length}/${entries.length} requested cards; missing cards stay vanilla`);
+      }
+      // Cosmetic item MVP: stage one static OSB2 mesh and let the native
+      // item layer substitute it for the Home-Run Bat's drawable model.
+      // Item kind 8 and all of its behavior remain vanilla.
+      if (params.has('inject_item_bat')) {
+        const url = params.get('inject_item_bat');
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status}`);
+        FS.writeFile('/inject-item-bat.osb', new Uint8Array(await resp.arrayBuffer()));
+        if (typeof ENV !== 'undefined') {
+          ENV.SSB64_INJECT_ITEM_BAT = '/inject-item-bat.osb';
+        }
+      }
+      // Roster injection (demo mode): inject_set=<osbfile>:<fkind>:<char>,...
+      // Each entry pulls bundles/<osbfile> plus that character's .osbui and
+      // announcer .wav when staged (missing extras are skipped silently).
+      if (params.has('inject_set')) {
+        const set = [], uiset = [], vset = [];
+        await Promise.all(params.get('inject_set').split(',').map(async (ent) => {
+          const [file, fk, chr] = ent.split(':');
+          if (!file || fk === undefined) return;
+          const r = await fetch('bundles/' + file);
+          if (!r.ok) throw new Error(`fetch bundles/${file}: ${r.status}`);
+          FS.writeFile(`/inject_fk${fk}.osb`, new Uint8Array(await r.arrayBuffer()));
+          set.push(`/inject_fk${fk}.osb:${fk}`);
+          if (chr) {
+            const ui = await fetch(`bundles/${chr}.osbui`);
+            if (ui.ok) {
+              FS.writeFile(`/inject_fk${fk}.osbui`, new Uint8Array(await ui.arrayBuffer()));
+              uiset.push(`/inject_fk${fk}.osbui:${fk}`);
+            }
+            const wav = await fetch(`bundles/${chr}.wav`);
+            if (wav.ok) {
+              FS.writeFile(`/inject_fk${fk}.wav`, new Uint8Array(await wav.arrayBuffer()));
+              vset.push(`/inject_fk${fk}.wav:${fk}`);
+            }
+          }
+        }));
+        if (typeof ENV !== 'undefined' && set.length) {
+          ENV.SSB64_INJECT_SET = set.join(',');
+          if (uiset.length) ENV.SSB64_INJECT_UI_SET = uiset.join(',');
+          if (vset.length) ENV.SSB64_INJECT_VOICE_SET = vset.join(',');
+        }
+      }
+      // Scalable roster (?roster=1): stage every character into MEMFS and
+      // write /roster.txt for the engine's paged character select. Each
+      // character sits on tile i%12 of page 1+i/12 and ships the mesh
+      // variant conformed to that tile's skeleton. (At 1000+ characters
+      // the bundles move to on-demand fetch; portraits stay tiny.)
+      if (params.has('roster')) {
+        try {
+          const roster = await (await fetch('/roster.json', { cache: 'no-cache' })).json();
+          FS.mkdirTree('/roster');
+          const lines = [];
+          // On-demand staging: the engine opens roster files through
+          // port_fopen_staged(), which calls Module.ensureStaged(path) and
+          // fetches the file if it is not in MEMFS yet. Only the tiny
+          // roster.txt is written up front; a thousand fighters cost nothing
+          // until the cursor lands on one. A background prefetch (first page
+          // first) fills a byte cache to avoid waiting on demand.
+          Module.__stageUrls = Module.__stageUrls || {};
+          // Pages (12 tiles each) whose bundles are prefetched in the
+          // background after boot; later pages stage on demand.
+          const PREFETCH_PAGES = 2;
+          const pageOne = [];
+          const later = [];
+          let tile = 0;
+          for (const c of roster) {
+            const fk = tile % 12;
+            if (!window.rosterStageable(c, fk)) {
+              console.warn(`roster: ${c.slug} missing its base variant — skipped`);
+              continue;
+            }
+            // the staged mesh targets the BASE fighter's skeleton, which
+            // may differ from the tile the character sits on
+            const baseFk = window.rosterBaseFk(c, fk);
+            const page = Math.floor(tile / 12);
+            tile++;
+            // One OSB6 per character: the engine picks the block for the
+            // fighter it spawns, so the same file serves every base.
+            // Production roster entries carry immutable object URLs
+            // (bundleUrl/uiUrl/voiceUrl); the relative bundles/<slug>.* names
+            // are the local-dev fallback served straight from pipeline/play.
+            const bundlePath = `/roster/${c.slug}.osb`;
+            Module.__stageUrls[bundlePath] = c.bundleUrl || `bundles/${c.slug}.osb6`;
+            const ui = c.ui ? `/roster/${c.slug}.osbui` : '';
+            const vox = c.voice ? `/roster/${c.slug}.wav` : '';
+            if (ui) Module.__stageUrls[ui] = c.uiUrl || `bundles/${c.slug}.osbui`;
+            if (vox) Module.__stageUrls[vox] = c.voiceUrl || `bundles/${c.slug}.wav`;
+            lines.push(`${c.slug}|${fk}|${bundlePath}|${ui}|${vox}|${c.short || ''}|${baseFk}|${(c.display || '').replace(/[|\n\r]/g, ' ')}`);
+            // The select screen paints page one's portraits (.osbui) as it
+            // builds; keep those eager so the first page never blocks.
+            // Everything else is on-demand: ensureStaged fetches a file the
+            // first time the engine opens it. Only the first
+            // PREFETCH_PAGES pages get a background prefetch — with a
+            // thousand-fighter roster, prefetching every ~1.6 MB bundle
+            // would pull the whole roster (gigabytes) through the origin and
+            // hold it in JS memory on every launch.
+            if (page === 0) pageOne.push(...[ui, vox].filter(Boolean));
+            else if (page < PREFETCH_PAGES) later.push(...[ui, vox].filter(Boolean));
+            if (page < PREFETCH_PAGES) later.push(bundlePath);
+          }
+          FS.writeFile('/roster.txt', lines.join('\n') + '\n');
+          await Promise.all(pageOne.map((path) => stageNow(path)));
+          prefetchStaged(later);
+          console.log(`roster: ${lines.length} characters registered, ${pageOne.length} files staged eagerly, ${later.length} prefetching`);
+        } catch (e) {
+          console.warn('roster staging failed:', e);
+        }
+      }
+      performance.mark('shell:staged');
+      setStatus('starting…');
+    } catch (e) {
+      // The site closed or re-launched this frame mid-stage: the aborted
+      // fetches reject with "Failed to fetch". That is not a ROM problem, so
+      // never tell the parent (it would drop the stored ROM and re-prompt).
+      if (window.__shellUnloading) throw e;
+      setStatus('asset load failed: ' + e.message);
+      // Let the embedding site react (close the game, re-prompt for the ROM)
+      // instead of leaving a black frame with small status text.
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'opensmash:engine-asset-error', message: e.message }, location.origin);
+        }
+      } catch (_) { /* cross-origin parent: nothing to tell */ }
+      throw e;
+    } finally {
+      removeRunDependency('battleship-files');
+    }
+  }],
+  onRuntimeInitialized: function () {
+    performance.mark('shell:runtime');
+    // Launch timeline (ms since the frame's navigation start) for tuning.
+    console.warn('[shell] timing', Object.fromEntries(
+      performance.getEntriesByType('mark').filter((m) => m.name.startsWith('shell:'))
+        .map((m) => [m.name.slice(6), Math.round(m.startTime)])));
+    // INVOKE_RUN=0: start the game ourselves once the FS is staged. Trailer
+    // capture holds here so the parent's Start Capture click can enter main()
+    // with browser activation and SDL audio is not blocked as autoplay.
+    console.warn('[shell] onRuntimeInitialized: o2r exists =',
+      FS.analyzePath('/BattleShip.o2r').exists, 'f3d =', FS.analyzePath('/f3d.o2r').exists);
+    let started = false;
+    const trailerHold = new URLSearchParams(location.search).get('SSB64_TRAILER_HOLD') === '1';
+    window.openSmashStartTrailer = function () {
+      if (started) return false;
+      started = true;
+      setStatus('');
+      Module.callMain(Module.arguments);
+      console.warn('[shell] callMain returned');
+
+      const params = new URLSearchParams(location.search);
+      if (params.get('SSB64_TRAILER_RECORD') === '1') {
+        setStatus('recording engine frames @ 60 fps…');
+        window.startTrailerClip()
+          .then(async (blob) => {
+            setStatus('finishing 2560x1920 trailer capture…');
+            const response = await fetch('/api/dev/trailer-capture', {
+              method: 'POST',
+              headers: { 'Content-Type': blob.type || 'video/webm' },
+              body: blob,
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || 'capture upload failed');
+            setStatus('trailer capture saved');
+            window.parent?.postMessage({
+              type: 'opensmash:trailer-capture-saved',
+              path: result.path,
+            }, location.origin);
+          })
+          .catch((error) => {
+            setStatus(`trailer capture failed: ${error.message}`);
+            console.error(error);
+          });
+      }
+      return true;
+    };
+
+    if (trailerHold) {
+      window.addEventListener('keydown', function (event) {
+        if (!started || event.repeat || event.key.toLowerCase() !== 'r') return;
+        event.preventDefault();
+        try {
+          window.parent.postMessage({ type: 'opensmash:trailer-reveal' }, location.origin);
+        } catch (_) { /* parent unavailable: use the visible capture control */ }
+      });
+      setStatus('');
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'opensmash:trailer-ready' }, location.origin);
+        }
+      } catch (_) { /* cross-origin parent: capture control stays unavailable */ }
+    } else {
+      window.openSmashStartTrailer();
+    }
+  },
+  // Stall attributor sink (?SSB64_STALL_WATCH=1). The engine calls this
+  // only for frames whose wall time exceeded 250ms. Records go to a ring
+  // buffer, NOT the console: a console.log burst is itself one of the
+  // candidate causes, so printing here would corrupt the measurement.
+  onStall: function (frame, workMs, reqMs, sleptMs, heapMb) {
+    const S = window.__stalls;
+    const overshoot = sleptMs - reqMs;
+    S.push({
+      t: Math.round(performance.now()),
+      frame, workMs, reqMs, sleptMs, heapMb,
+      wasmMb: Module.HEAPU8 ? (Module.HEAPU8.byteLength >> 20) : 0,
+      jsMb: (performance.memory ? (performance.memory.usedJSHeapSize >> 20) : -1),
+      // Which side of the yield ate the time.
+      blame: workMs >= overshoot ? 'wasm' : 'browser',
+    });
+    if (S.length > 500) S.shift();
+  },
+  print: (t) => console.log(t),
+  onAbort: (reason) => reportEngineFailure(reason),
+  printErr: (t) => {
+    // Timestamp slow-inline-load reports so dumpStalls can correlate them
+    // with stall records (both use performance.now()-based t).
+    if (typeof t === 'string' && t.includes('slow inline')) {
+      window.__slowLoads.push({ t: Math.round(performance.now()), msg: t });
+      if (window.__slowLoads.length > 200) window.__slowLoads.shift();
+    }
+    console.warn(t);
+  },
+  onTutorialStart: () => {
+    window.dispatchEvent(new Event('opensmash:tutorial-start'));
+  },
+  // Lets captureFrame() read back the last presented frame.
+  webglContextAttributes: { preserveDrawingBuffer: true },
+};
+
+// ---- dev capture helpers ------------------------------------------------
+// captureFrame(): PNG data-URL of the current canvas.
+// startClip(ms): records a WebM of the canvas, resolves to an object URL.
+window.captureFrame = () => Module.canvas.toDataURL('image/png');
+window.startClip = (ms = 3000, fps = 30) => new Promise((resolve, reject) => {
+  const stream = Module.canvas.captureStream(fps);
+  const rec = new MediaRecorder(stream, { mimeType: 'video/webm' });
+  const chunks = [];
+  rec.ondataavailable = (e) => chunks.push(e.data);
+  rec.onstop = () => resolve(URL.createObjectURL(new Blob(chunks, { type: 'video/webm' })));
+  rec.onerror = reject;
+  rec.start();
+  setTimeout(() => rec.stop(), ms);
+});
+// Trailer source capture. The outer site's CRT is deliberately not part of
+// this stream: only completed frames from the engine canvas are recorded.
+// The dev upload endpoint performs the expensive 2560x1920 constant-60-fps
+// finish after recording so encoding cannot steal frames from the game.
+window.startTrailerClip = () => {
+  if (window.__trailerClipPromise) return window.__trailerClipPromise;
+
+  const fps = 60;
+  const stream = Module.canvas.captureStream(fps);
+  const videoTrack = stream.getVideoTracks()[0];
+  if (videoTrack) videoTrack.contentHint = 'motion';
+  // SDL2 is exported on the Emscripten Module, not window. The old lookup
+  // silently missed it and produced a video-only WebM.
+  const sdl2 = Module.SDL2 || window.SDL2;
+  const audioContext = sdl2?.audioContext;
+  const audioNode = sdl2?.audio?.scriptProcessorNode;
+  let audioDestination = null;
+  if (audioContext && audioNode) {
+    if (audioContext.state === 'suspended') void audioContext.resume();
+    audioDestination = audioContext.createMediaStreamDestination();
+    audioNode.connect(audioDestination);
+    for (const track of audioDestination.stream.getAudioTracks()) stream.addTrack(track);
+  } else {
+    for (const track of stream.getTracks()) track.stop();
+    return Promise.reject(new Error('SDL game audio output is not ready'));
+  }
+
+  const preferredMimeTypes = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  const mimeType = preferredMimeTypes.find((type) => MediaRecorder.isTypeSupported(type));
+  const recorder = new MediaRecorder(stream, {
+    ...(mimeType ? { mimeType } : {}),
+    videoBitsPerSecond: 20_000_000,
+    audioBitsPerSecond: 192_000,
+  });
+  const chunks = [];
+  let stopTimer = 0;
+  let tutorialTimer = 0;
+
+  window.__trailerClipPromise = new Promise((resolve, reject) => {
+    const stop = () => {
+      if (recorder.state !== 'inactive') recorder.stop();
+    };
+    window.stopTrailerClip = stop;
+    const onTutorialStart = () => {
+      tutorialTimer = setTimeout(stop, 1500);
+    };
+    window.addEventListener('opensmash:tutorial-start', onTutorialStart, { once: true });
+    stopTimer = setTimeout(stop, 5 * 60 * 1000);
+    recorder.ondataavailable = (event) => {
+      if (event.data.size) chunks.push(event.data);
+    };
+    recorder.onerror = (event) => reject(event.error || new Error('Trailer recording failed'));
+    recorder.onstop = () => {
+      clearTimeout(stopTimer);
+      clearTimeout(tutorialTimer);
+      window.removeEventListener('opensmash:tutorial-start', onTutorialStart);
+      if (audioDestination && audioNode) {
+        try { audioNode.disconnect(audioDestination); } catch { /* already disconnected */ }
+      }
+      for (const track of stream.getTracks()) track.stop();
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
+      window.stopTrailerClip = null;
+      window.__trailerClipPromise = null;
+      resolve(blob);
+    };
+    recorder.start(1000);
+  });
+  return window.__trailerClipPromise;
+};
+// pressKey(code, ms): synthetic key hold on the canvas (SDL listens on it).
+window.pressKey = (code, ms = 120) => new Promise((resolve) => {
+  const t = Module.canvas;
+  t.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+  setTimeout(() => {
+    t.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
+    resolve();
+  }, ms);
+});
+</script>
+<script>
+// ---- matchup card ----------------------------------------------------
+// Vanilla VS mode has no "A VS B" screen (only 1P Game does), so with a
+// generated roster nobody knows who they are fighting. Two ticks into a VS
+// battle the engine calls Module.onMatchup(json) and freezes until
+// Module._port_matchup_release(); this shows the card in between: portrait,
+// name and port tag per fighter, announcer name clips in order, any button
+// skips. Skipped entirely for capture / replay harness runs (no handler ->
+// the engine never holds, so tick timing stays exact).
+(() => {
+  const params = new URLSearchParams(location.search);
+  // The engine now draws its own VS card (scvsintro.c); this DOM card is
+  // kept as an opt-in fallback (?matchup=1).
+  if (params.get('matchup') !== '1') return;
+  const VANILLA = ['Mario', 'Fox', 'Donkey Kong', 'Samus', 'Luigi', 'Link',
+                   'Yoshi', 'Captain Falcon', 'Kirby', 'Pikachu', 'Jigglypuff', 'Ness'];
+  const PORT_COLORS = ['#ff4a3d', '#4a7dff', '#ffd23d', '#4ad35a'];
+  const TEAM_COLORS = ['#ff4a3d', '#4a7dff', '#4ad35a', '#ffd23d'];
+  const MIN_SHOW_MS = 3400;
+  const el = document.getElementById('matchup');
+  const row = el.querySelector('.row');
+  let rosterPromise = null;
+  const roster = () => (rosterPromise ||= fetch('/roster.json', { cache: 'no-cache' })
+    .then((r) => (r.ok ? r.json() : []))
+    .then((list) => new Map(list.map((c) => [c.slug, c])))
+    .catch(() => new Map()));
+  // Legacy single-inject launches (?inject=bundles/<slug>.osb6&fkind=N)
+  // carry no roster binding; recover the slug from the bundle URL.
+  const legacySlug = (p) => {
+    const inject = params.get('inject');
+    if (!inject) return '';
+    if (String(p.p) !== (params.get('player') || '0')) return '';
+    if (String(p.fkind) !== (params.get('fkind') || '0')) return '';
+    const m = inject.match(/([a-z0-9]+)(?:-[a-z]+)?\.osb\d?$/);
+    return m ? m[1] : '';
+  };
+  const slugFromSet = (p) => {
+    // ?inject_set=<osb>:<fkind>:<char>,...
+    for (const entry of (params.get('inject_set') || '').split(',')) {
+      const [, fk, chr] = entry.split(':');
+      if (chr && Number(fk) === p.fkind) return chr;
+    }
+    return '';
+  };
+  const release = () => { try { Module._port_matchup_release(); } catch (e) { console.warn(e); } };
+  let active = null;
+
+  const playClips = (urls, signal) => new Promise((resolve) => {
+    let i = 0;
+    const next = () => {
+      if (signal.aborted || i >= urls.length) return resolve();
+      const a = new Audio(urls[i++]);
+      a.volume = 0.9;
+      a.addEventListener('ended', () => setTimeout(next, 260));
+      a.addEventListener('error', next);
+      signal.addEventListener('abort', () => { try { a.pause(); } catch (_) {} }, { once: true });
+      a.play().catch(next);
+    };
+    next();
+  });
+
+  Module.onMatchup = async (json) => {
+    const data = JSON.parse(json);
+    const players = (data.players || []).filter((p) => p.kind === 0 || p.kind === 1);
+    if (players.length < 2) return release();
+    if (active) active.abort();
+    const ctl = new AbortController();
+    active = ctl;
+    const chars = await roster();
+    row.innerHTML = '';
+    el.classList.toggle('compact', players.length > 2);
+    const clips = [];
+    players.forEach((p, idx) => {
+      const slug = p.slug || legacySlug(p) || slugFromSet(p);
+      const c = slug ? chars.get(slug) : null;
+      const name = c?.display || c?.name || (slug ? slug : VANILLA[p.fkind] || `Fighter ${p.fkind}`);
+      const color = data.team ? TEAM_COLORS[p.team] : (p.kind === 0 ? PORT_COLORS[p.p] : '#cfcfcf');
+      const tag = p.kind === 0 ? `${p.p + 1}P` : 'CP';
+      if (idx > 0) {
+        const vs = document.createElement('div');
+        vs.className = 'vs';
+        vs.textContent = 'VS';
+        row.appendChild(vs);
+      }
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.style.setProperty('--pc', color);
+      card.style.setProperty('--from', idx === 0 ? '-12vw' : (idx === players.length - 1 ? '12vw' : '0'));
+      const art = document.createElement('div');
+      art.className = 'art';
+      if (slug) {
+        // Site route; the bare engine harness has no portraits, so a 404
+        // just leaves the plain tile.
+        const img = new Image();
+        img.onload = () => { art.style.backgroundImage = `url("${img.src}")`; };
+        img.src = `/character-assets/${slug}/portrait.png`;
+      } else {
+        art.classList.add('vanilla');
+        art.dataset.initial = name[0];
+      }
+      const tagEl = document.createElement('div');
+      tagEl.className = 'tag';
+      tagEl.textContent = tag;
+      art.appendChild(tagEl);
+      const nameEl = document.createElement('div');
+      nameEl.className = 'name';
+      nameEl.textContent = name;
+      card.appendChild(art);
+      card.appendChild(nameEl);
+      row.appendChild(card);
+      if (slug && (c ? c.voice !== false : true)) clips.push(`bundles/${slug}.wav`);
+    });
+    el.classList.add('show');
+    // Timer, not rAF: a background/throttled tab starves rAF while the
+    // engine keeps running on Asyncify sleeps, and the card would never
+    // fade in.
+    void el.offsetWidth;
+    setTimeout(() => { if (active === ctl) el.classList.add('in'); }, 30);
+    const started = performance.now();
+    const skip = () => ctl.abort();
+    const keyHandler = (e) => { if (!e.repeat) skip(); };
+    window.addEventListener('keydown', keyHandler);
+    el.addEventListener('pointerdown', skip);
+    let padTimer = 0;
+    const pollPads = () => {
+      if (ctl.signal.aborted) return clearInterval(padTimer);
+      for (const g of navigator.getGamepads ? navigator.getGamepads() : []) {
+        if (g && g.buttons.some((b) => b.pressed)) return skip();
+      }
+    };
+    // Ignore pads for the first moment so the button that confirmed the
+    // stage does not also skip the card.
+    setTimeout(() => { if (!ctl.signal.aborted) padTimer = setInterval(pollPads, 50); }, 400);
+    await Promise.race([
+      playClips(clips, ctl.signal).then(() => new Promise((r) => setTimeout(r, 700))),
+      new Promise((r) => ctl.signal.addEventListener('abort', r, { once: true })),
+    ]);
+    if (!ctl.signal.aborted) {
+      const remain = MIN_SHOW_MS - (performance.now() - started);
+      if (remain > 0) {
+        await Promise.race([
+          new Promise((r) => setTimeout(r, remain)),
+          new Promise((r) => ctl.signal.addEventListener('abort', r, { once: true })),
+        ]);
+      }
+    }
+    window.removeEventListener('keydown', keyHandler);
+    el.removeEventListener('pointerdown', skip);
+    clearInterval(padTimer);
+    if (!ctl.signal.aborted) ctl.abort();
+    el.classList.remove('in');
+    release();
+    setTimeout(() => { if (active === ctl) el.classList.remove('show'); }, 260);
+    Module.canvas.focus();
+  };
+})();
+</script>
+<script>
+// Resolve the ROM → archive step BEFORE the engine script is inserted.
+// Extraction alone takes ~3.5 s, but overlapped with Chrome tier-compiling
+// the 7.5 MB engine wasm it balloons to 40 s+: the compile threads hog every
+// core and Torch's own module never leaves baseline code. Serial is far
+// cheaper. The site normally prewarms the archive during its launch
+// animation, so this usually resolves from the cache in milliseconds.
+// preRun awaits the same promise; a rejection surfaces there as a status.
+// Adopt the site's gesture-unlocked AudioContext when we are its same-origin
+// iframe. WebKit refuses to start an AudioContext without a gesture in THIS
+// document, and the player's launching click lands in the parent page, so
+// SDL's own `new AudioContext` would sit suspended until a second click on
+// the canvas. The parent creates and resumes one on its first trusted
+// gesture (web-prototype App.jsx); the first construction here returns it.
+(function () {
+  var shared = null;
+  try { shared = window.parent !== window ? window.parent.__openSmashAudioContext : null; } catch (e) { shared = null; }
+  if (!shared) return;
+  var Native = window.AudioContext || window.webkitAudioContext;
+  if (!Native) return;
+  var adopted = false;
+  function AdoptingAudioContext() {
+    if (!adopted) { adopted = true; return shared; }
+    return new Native();
+  }
+  AdoptingAudioContext.prototype = Native.prototype;
+  window.AudioContext = AdoptingAudioContext;
+  if (window.webkitAudioContext) window.webkitAudioContext = AdoptingAudioContext;
+})();
+window.__shellUnloading = false;
+// The parent owns the gesture-unlocked context across matches. Disconnect
+// this frame's nodes before navigation so it cannot retain the old engine.
+function releaseEngineAudio() {
+  window.__shellUnloading = true;
+  const sdl = window.Module?.SDL2;
+  if (!sdl) return;
+  for (const audio of [sdl.audio, sdl.capture]) {
+    if (!audio) continue;
+    clearInterval(audio.silenceTimer);
+    if (audio.scriptProcessorNode) {
+      audio.scriptProcessorNode.onaudioprocess = null;
+      audio.scriptProcessorNode.disconnect();
+      audio.scriptProcessorNode = undefined;
+    }
+    audio.mediaStreamNode?.disconnect();
+    audio.currentOutputBuffer = undefined;
+    audio.silenceBuffer = undefined;
+  }
+  let shared;
+  try { shared = window.parent.__openSmashAudioContext; } catch {}
+  if (sdl.audioContext && sdl.audioContext !== shared && sdl.audioContext.state !== 'closed') {
+    void sdl.audioContext.close().catch(() => {});
+  }
+}
+addEventListener('pagehide', releaseEngineAudio);
+addEventListener('beforeunload', releaseEngineAudio);
+window.__engineManifest = fetch('manifest.json?v=c5a89c4fd958').then((r) => r.json());
+window.__archivePromise = (async () => {
+  const manifest = await window.__engineManifest;
+  if (manifest.files.some(f => f.path === '/BattleShip.o2r')) return null;
+  const entry = manifest.files.find(f => f.path === '/BattleShip.o2r.recipe');
+  const recipe = entry ? (await (await fetch(entry.url)).text()).trim() : 'unknown';
+  const { ensureArchive } = await import('./rom-extract.js?v=c5a89c4fd958');
+  return ensureArchive({ recipe, version: 'c5a89c4fd958',
+    setStatus: (t) => { if (typeof setStatus === 'function') setStatus(t); } });
+})();
+window.__archivePromise.catch(() => {}).then(() => {
+  performance.mark('shell:engine-script');
+  const script = document.createElement('script');
+  script.src = 'BattleShip.js?v=c5a89c4fd958';
+  script.onerror = () => reportEngineFailure('Could not download the game engine. Please try again.');
+  document.body.appendChild(script);
+});
+</script>
+</body>
+</html>
