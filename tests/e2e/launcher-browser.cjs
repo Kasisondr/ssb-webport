@@ -1,14 +1,29 @@
 // End-to-end check of the native package in a real browser.
 //
-// Runs against `python3 tools/serve.py --rom <rom>` on port 8005, injects the
+// Run from the repo root after `node --test tests/*.cjs`: it talks to
+// `python3 tools/serve.py --rom <rom>` on port 8005, injects the
 // ROM through the launcher's own file input (the flow a player uses), waits for
 // the engine iframe to boot, verifies the canvas actually renders, presses keys,
 // verifies the picture changes, and remaps a control through the launcher's own
 // editor to prove the running engine adopts the new key. Prints engine console when verbosely
 // asked (SMASH_VERBOSE=1) and on failure.
-const {chromium}=require('../../smash64-web/node_modules/@playwright/test');
 const path=require('node:path');const fs=require('node:fs');const assert=require('node:assert/strict');
-const ROOT=path.join(__dirname,'..');
+// Playwright is not a dependency of this repo, so accept a local install, an
+// explicit PLAYWRIGHT_MODULE, or the sibling checkout this port was built next
+// to, and say plainly what to install when none of them is there.
+const playwright=()=>{
+ const tries=[process.env.PLAYWRIGHT_MODULE,'@playwright/test',
+  path.join(__dirname,'..','..','node_modules','@playwright/test'),
+  path.join(__dirname,'..','..','..','smash64-web','node_modules','@playwright/test')].filter(Boolean);
+ for(const candidate of tries){try{return require(candidate);}catch{}}
+ console.error('Playwright is not installed: run `npm i -D @playwright/test` here, or set '
+  +'PLAYWRIGHT_MODULE to a @playwright/test directory. This E2E also needs a running '
+  +'`python3 tools/serve.py --rom <rom>` and SMASH_ROM (or the ROM at the default path).');
+ process.exit(2);
+};
+const {chromium}=playwright();
+const ROOT=path.join(__dirname,'..','..');
+const SHOT=path.join(__dirname,'native-launcher.png');
 const ROM=process.env.SMASH_ROM||path.resolve(ROOT,'..','Super Smash Bros. (Europe) (En,Fr,De).z64');
 const URL=process.env.SMASH_URL||'http://127.0.0.1:8005';
 const VERBOSE=process.env.SMASH_VERBOSE==='1'||process.env.SMASH_VERBOSE==='true';
@@ -192,7 +207,7 @@ const frameStats=()=>{
   for(const key of ['Enter','Enter']){await page.keyboard.press(key);await sleep(1200);}
   const after=await page.evaluate(frameStats);
   console.log('frame after Enter:',after);
-  await page.screenshot({path:path.join(__dirname,'native-launcher.png'),fullPage:false});
+  await page.screenshot({path:SHOT,fullPage:false});
   const changed=after.nonBlack!==boot.nonBlack;
   console.log(changed?'input changed the rendered frame':'frame unchanged (title may be static)');
 
@@ -271,7 +286,7 @@ const frameStats=()=>{
   console.log('OK: the keys reset spares the controllers');
  }catch(error){
   dump();
-  await page.screenshot({path:path.join(__dirname,'native-launcher.png'),fullPage:false}).catch(()=>{});
+  await page.screenshot({path:SHOT,fullPage:false}).catch(()=>{});
   throw error;
  }finally{
   await browser.close();

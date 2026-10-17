@@ -105,7 +105,7 @@ publishes neither (a modularized glue behind an IIFE would do that), add
 
 Two tests hold this: `tests/bindings.cjs` runs the real sampler against
 both forms (a global-only build and a `Module.HEAP32` build) and fails if
-the rows stop reaching the heap, and `tests/launcher-browser.cjs`
+the rows stop reaching the heap, and `tests/e2e/launcher-browser.cjs`
 captures the pointer the engine passes, remaps a key and a pad button in
 the launcher, and reads the resulting four rows back out of the engine's
 own buffer.
@@ -127,6 +127,6 @@ The same stub drives the pad editor: a pad injected into the
 and pressing one of its buttons while a chip is capturing is exactly
 what a real controller would do. `tests/native-input.cjs` runs the
 shipped sampler this way (the full default table, a per-pad remap, the
-walk modifier, the digital stick fallback) and `tests/launcher-browser.cjs`
+walk modifier, the digital stick fallback) and `tests/e2e/launcher-browser.cjs`
 remaps a button in the real browser and reads the pad word the engine
 produced from it.

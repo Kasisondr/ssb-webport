@@ -4,3 +4,7 @@ __pycache__/
 *.z64
 *.n64
 *.v64
+tests/native-launcher.png
+build-*/
+*.log
+.DS_Store

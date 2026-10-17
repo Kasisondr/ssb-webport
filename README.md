@@ -51,7 +51,8 @@ The Emscripten SDK is reused from `../supersponge-web/vendor/emsdk`. Build depen
 ```sh
 .venv/bin/python tools/build.py                     # patch + engine + torch + package
 .venv/bin/python tools/build.py --only torch,package # extractor/recipe change only
-node --test tests/*.cjs
+node --test tests/*.cjs             # unit suites (no browser)
+node tests/e2e/launcher-browser.cjs  # E2E: needs Playwright, serve.py and a ROM
 python3 tools/serve.py --open
 ```
 
